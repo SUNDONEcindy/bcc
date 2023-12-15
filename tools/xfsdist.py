@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/env python
 # @lint-avoid-python-3-compatibility-imports
 #
 # xfsdist  Summarize XFS operation latency.
@@ -37,6 +37,8 @@ parser.add_argument("interval", nargs="?",
     help="output interval, in seconds")
 parser.add_argument("count", nargs="?", default=99999999,
     help="number of outputs")
+parser.add_argument("--ebpf", action="store_true",
+    help=argparse.SUPPRESS)
 args = parser.parse_args()
 pid = args.pid
 countdown = int(args.count)
@@ -68,21 +70,26 @@ BPF_HISTOGRAM(dist, dist_key_t);
 // time operation
 int trace_entry(struct pt_regs *ctx)
 {
-    u32 pid = bpf_get_current_pid_tgid();
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    u32 pid = pid_tgid >> 32;
+    u32 tid = (u32)pid_tgid;
+
     if (FILTER_PID)
         return 0;
     u64 ts = bpf_ktime_get_ns();
-    start.update(&pid, &ts);
+    start.update(&tid, &ts);
     return 0;
 }
 
 static int trace_return(struct pt_regs *ctx, const char *op)
 {
     u64 *tsp;
-    u32 pid = bpf_get_current_pid_tgid();
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    u32 pid = pid_tgid >> 32;
+    u32 tid = (u32)pid_tgid;
 
     // fetch timestamp and calculate delta
-    tsp = start.lookup(&pid);
+    tsp = start.lookup(&tid);
     if (tsp == 0) {
         return 0;   // missed start or filtered
     }
@@ -91,9 +98,9 @@ static int trace_return(struct pt_regs *ctx, const char *op)
     // store as histogram
     dist_key_t key = {.slot = bpf_log2l(delta)};
     __builtin_memcpy(&key.op, op, sizeof(key.op));
-    dist.increment(key);
+    dist.atomic_increment(key);
 
-    start.delete(&pid);
+    start.delete(&tid);
     return 0;
 }
 
@@ -126,8 +133,10 @@ if args.pid:
     bpf_text = bpf_text.replace('FILTER_PID', 'pid != %s' % pid)
 else:
     bpf_text = bpf_text.replace('FILTER_PID', '0')
-if debug:
+if debug or args.ebpf:
     print(bpf_text)
+    if args.ebpf:
+        exit()
 
 # load BPF program
 b = BPF(text=bpf_text)
@@ -160,7 +169,7 @@ while (1):
     if args.interval and (not args.notimestamp):
         print(strftime("%H:%M:%S:"))
 
-    dist.print_log2_hist(label, "operation")
+    dist.print_log2_hist(label, "operation", section_print_fn=bytes.decode)
     dist.clear()
 
     countdown -= 1

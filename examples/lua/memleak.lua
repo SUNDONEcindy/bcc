@@ -26,7 +26,7 @@ struct alloc_info_t {
 
 BPF_HASH(sizes, u64);
 BPF_HASH(allocs, u64, struct alloc_info_t);
-BPF_STACK_TRACE(stack_traces, 10240)
+BPF_STACK_TRACE(stack_traces, 10240);
 
 int alloc_enter(struct pt_regs *ctx, size_t size)
 {
@@ -113,7 +113,7 @@ return function(BPF, utils)
     size_filter = "if (size > %d) return 0;" % args.max_size
   end
 
-  local stack_flags = "BPF_F_REUSE_STACKID"
+  local stack_flags = "0"
   if args.pid then
     stack_flags = stack_flags .. "|BPF_F_USER_STACK"
   end

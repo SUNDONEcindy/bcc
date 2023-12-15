@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # Copyright (c) PLUMgrid, Inc.
 # Licensed under the Apache License, Version 2.0 (the "License")
 
@@ -8,16 +8,21 @@ from time import sleep
 import sys
 from unittest import main, TestCase
 
-text = """
+text = b"""
 #include <linux/ptrace.h>
 struct Ptr { u64 ptr; };
-struct Counters { u64 stat1; };
+struct Counters { char unused; __int128 stat1; };
 BPF_HASH(stats, struct Ptr, struct Counters, 1024);
 
 int count_sched(struct pt_regs *ctx) {
   struct Ptr key = {.ptr=PT_REGS_PARM1(ctx)};
-  struct Counters zleaf = {0};
-  stats.lookup_or_init(&key, &zleaf)->stat1++;
+  struct Counters zleaf;
+
+  memset(&zleaf, 0, sizeof(zleaf));
+  struct Counters *val = stats.lookup_or_try_init(&key, &zleaf);
+  if (val) {
+    val->stat1++;
+  }
   return 0;
 }
 """
@@ -25,14 +30,15 @@ int count_sched(struct pt_regs *ctx) {
 class TestTracingEvent(TestCase):
     def setUp(self):
         b = BPF(text=text, debug=0)
-        self.stats = b.get_table("stats")
-        b.attach_kprobe(event="finish_task_switch", fn_name="count_sched", pid=0, cpu=-1)
+        self.stats = b.get_table(b"stats")
+        b.attach_kprobe(event_re=b"^finish_task_switch$|^finish_task_switch\.isra\.\d$",
+                        fn_name=b"count_sched")
 
     def test_sched1(self):
         for i in range(0, 100):
             sleep(0.01)
         for key, leaf in self.stats.items():
-            print("ptr %x:" % key.ptr, "stat1 %d" % leaf.stat1)
+            print("ptr %x:" % key.ptr, "stat1 (%d %d)" % (leaf.stat1[1], leaf.stat1[0]))
 
 if __name__ == "__main__":
     main()

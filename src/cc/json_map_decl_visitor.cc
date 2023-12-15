@@ -18,7 +18,9 @@
 #include <string>
 
 #include <clang/AST/ASTContext.h>
+#include <clang/AST/RecordLayout.h>
 #include <clang/AST/RecursiveASTVisitor.h>
+#include <llvm/ADT/StringExtras.h>
 #include "common.h"
 #include "table_desc.h"
 
@@ -40,6 +42,12 @@ class BMapDeclVisitor : public clang::RecursiveASTVisitor<BMapDeclVisitor> {
   bool VisitTypedefType(const clang::TypedefType *T);
   bool VisitTagType(const clang::TagType *T);
   bool VisitPointerType(const clang::PointerType *T);
+  bool VisitEnumDecl(clang::EnumDecl *D);
+  bool VisitAttr(clang::Attr *A);
+
+ private:
+  bool shouldSkipPadding(const RecordDecl *D);
+  void genJSONForField(FieldDecl *F);
 
  private:
   clang::ASTContext &C;
@@ -48,11 +56,50 @@ class BMapDeclVisitor : public clang::RecursiveASTVisitor<BMapDeclVisitor> {
 
 // Encode the struct layout as a json description
 BMapDeclVisitor::BMapDeclVisitor(ASTContext &C, string &result) : C(C), result_(result) {}
+
+bool BMapDeclVisitor::shouldSkipPadding(const RecordDecl *D) {
+  if (D->isUnion() || D->field_empty())
+    return true;
+  for (auto F : D->getDefinition()->fields()) {
+    if (F->isBitField())
+      return true;
+    QualType Ty = F->getType();
+    if (Ty->isIncompleteArrayType())
+      return true;
+  }
+  return false;
+}
+
+void BMapDeclVisitor::genJSONForField(FieldDecl *F) {
+  if (F->isAnonymousStructOrUnion()) {
+    if (const RecordType *R = dyn_cast<RecordType>(F->getType()))
+      TraverseDecl(R->getDecl());
+    result_ += ", ";
+    return;
+  }
+  result_ += "[";
+  TraverseDecl(F);
+  if (const ConstantArrayType *T = dyn_cast<ConstantArrayType>(F->getType()))
+#if LLVM_MAJOR_VERSION >= 13
+    result_ += ", [" + toString(T->getSize(), 10, false) + "]";
+#else
+    result_ += ", [" + T->getSize().toString(10, false) + "]";
+#endif
+  if (F->isBitField())
+    result_ += ", " + to_string(F->getBitWidthValue(C));
+  result_ += "], ";
+}
+
 bool BMapDeclVisitor::VisitFieldDecl(FieldDecl *D) {
   result_ += "\"";
   result_ += D->getName();
   result_ += "\",";
   return true;
+}
+
+bool BMapDeclVisitor::VisitEnumDecl(EnumDecl *D) {
+  TraverseType(D->getIntegerType());
+  return false;
 }
 
 bool BMapDeclVisitor::TraverseRecordDecl(RecordDecl *D) {
@@ -61,32 +108,54 @@ bool BMapDeclVisitor::TraverseRecordDecl(RecordDecl *D) {
     return false;
   return true;
 }
+
 bool BMapDeclVisitor::VisitRecordDecl(RecordDecl *D) {
   result_ += "[\"";
   result_ += D->getName();
   result_ += "\", [";
-  for (auto F : D->getDefinition()->fields()) {
-    if (F->isAnonymousStructOrUnion()) {
-      if (const RecordType *R = dyn_cast<RecordType>(F->getType()))
-        TraverseDecl(R->getDecl());
-      result_ += ", ";
-      continue;
+
+  bool SkipPadding = shouldSkipPadding(D);
+  if (SkipPadding) {
+    for (auto F : D->getDefinition()->fields()) {
+      genJSONForField(F);
     }
-    result_ += "[";
-    TraverseDecl(F);
-    if (const ConstantArrayType *T = dyn_cast<ConstantArrayType>(F->getType()))
-      result_ += ", [" + T->getSize().toString(10, false) + "]";
-    if (F->isBitField())
-      result_ += ", " + to_string(F->getBitWidthValue(C));
-    result_ += "], ";
+  } else {
+    const ASTRecordLayout &Layout = C.getASTRecordLayout(D);
+    CharUnits Offset = C.toCharUnitsFromBits(Layout.getFieldOffset(0));
+    for (auto F : D->getDefinition()->fields()) {
+      CharUnits FieldSize = C.getTypeSizeInChars(F->getType());
+      auto FieldOffsetBits = Layout.getFieldOffset(F->getFieldIndex());
+      CharUnits FieldOffset = C.toCharUnitsFromBits(FieldOffsetBits);
+
+      uint64_t Padding = (FieldOffset - Offset).getQuantity();
+      if (Padding) {
+        /* Padding before this field with "char __pad_<FieldIndex>[Padding]". */
+        result_ += "[\"__pad_" + to_string(F->getFieldIndex()) + "\",\"char\",["
+                + to_string(Padding) + "]], ";
+      }
+      Offset = FieldOffset + FieldSize;
+      genJSONForField(F);
+    }
+
+    /* Additional Padding after the last field so that the Record Size matches */
+    CharUnits RecordSize = Layout.getSize();
+    if (RecordSize > Offset) {
+        result_ += "[\"__pad_end\",\"char\",["
+                + to_string((RecordSize - Offset).getQuantity()) + "]], ";
+    }
   }
+
   if (!D->getDefinition()->field_empty())
     result_.erase(result_.end() - 2);
   result_ += "]";
   if (D->isUnion())
     result_ += ", \"union\"";
-  else if (D->isStruct())
-    result_ += ", \"struct\"";
+  else if (D->isStruct()) {
+    if (SkipPadding)
+      result_ += ", \"struct\"";
+    else
+      result_ += ", \"struct_packed\"";
+  }
   result_ += "]";
   return true;
 }
@@ -105,6 +174,7 @@ bool BMapDeclVisitor::VisitBuiltinType(const BuiltinType *T) {
   result_ += "\"";
   return true;
 }
+bool BMapDeclVisitor::VisitAttr(clang::Attr *A) { return false; }
 
 class JsonMapTypesVisitor : public virtual MapTypesVisitor {
  public:

@@ -84,21 +84,32 @@ int trace_req_completion(struct pt_regs *ctx, struct request *req)
     valp = infobyreq.lookup(&req);
     if (valp == 0) {
         data.len = req->__data_len;
-        strcpy(data.name,"?");
+        data.name[0] = '?';
+        data.name[1] = 0;
     } else {
         data.pid = valp->pid;
         data.len = req->__data_len;
         data.sector = req->__sector;
-        bpf_probe_read(&data.name, sizeof(data.name), valp->name);
-        bpf_probe_read(&data.disk_name, sizeof(data.disk_name),
+        bpf_probe_read_kernel(&data.name, sizeof(data.name), valp->name);
+        bpf_probe_read_kernel(&data.disk_name, sizeof(data.disk_name),
                        req->rq_disk->disk_name);
     }
 
-    if (req->cmd_flags & REQ_WRITE) {
-        data.rwflag=1;
-    } else {
-        data.rwflag=0;
-    }
+/*
+ * The following deals with a kernel version change (in mainline 4.7, although
+ * it may be backported to earlier kernels) with how block request write flags
+ * are tested. We handle both pre- and post-change versions here. Please avoid
+ * kernel version tests like this as much as possible: they inflate the code,
+ * test, and maintenance burden.
+ */
+#ifdef REQ_WRITE
+    data.rwflag = !!(req->cmd_flags & REQ_WRITE);
+#elif defined(REQ_OP_SHIFT)
+    data.rwflag = !!((req->cmd_flags >> REQ_OP_SHIFT) == REQ_OP_WRITE);
+#else
+    data.rwflag = !!((req->cmd_flags & REQ_OP_MASK) == REQ_OP_WRITE);
+#endif
+
     events.perf_submit(ctx,&data,sizeof(data));
     start.delete(&req);
     infobyreq.delete(&req);
@@ -115,7 +126,7 @@ return function(BPF, utils)
   bpf:attach_kprobe{event="blk_account_io_start", fn_name="trace_pid_start"}
   bpf:attach_kprobe{event="blk_start_request", fn_name="trace_req_start"}
   bpf:attach_kprobe{event="blk_mq_start_request", fn_name="trace_req_start"}
-  bpf:attach_kprobe{event="blk_account_io_completion",
+  bpf:attach_kprobe{event="blk_account_io_done",
       fn_name="trace_req_completion"}
 
   print("%-14s %-14s %-6s %-7s %-2s %-9s %-7s %7s" % {"TIME(s)", "COMM", "PID",
@@ -179,5 +190,5 @@ return function(BPF, utils)
       char name[$];
     }
   ]], {DISK_NAME_LEN, TASK_COMM_LEN}, 64)
-  bpf:kprobe_poll_loop()
+  bpf:perf_buffer_poll_loop()
 end

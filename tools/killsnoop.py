@@ -1,10 +1,10 @@
-#!/usr/bin/python
+#!/usr/bin/env python
 # @lint-avoid-python-3-compatibility-imports
 #
 # killsnoop Trace signals issued by the kill() syscall.
 #           For Linux, uses BCC, eBPF. Embedded C.
 #
-# USAGE: killsnoop [-h] [-x] [-p PID]
+# USAGE: killsnoop [-h] [-x] [-p PID] [-T PID] [-s SIGNAL]
 #
 # Copyright (c) 2015 Brendan Gregg.
 # Licensed under the Apache License, Version 2.0 (the "License")
@@ -14,15 +14,17 @@
 
 from __future__ import print_function
 from bcc import BPF
+from bcc.utils import ArgString, printb
 import argparse
 from time import strftime
-import ctypes as ct
 
 # arguments
 examples = """examples:
     ./killsnoop           # trace all kill() signals
     ./killsnoop -x        # only show failed kills
     ./killsnoop -p 181    # only trace PID 181
+    ./killsnoop -T 189    # only trace target PID 189
+    ./killsnoop -s 9      # only trace signal 9
 """
 parser = argparse.ArgumentParser(
     description="Trace signals issued by the kill() syscall",
@@ -31,7 +33,15 @@ parser = argparse.ArgumentParser(
 parser.add_argument("-x", "--failed", action="store_true",
     help="only show failed kill syscalls")
 parser.add_argument("-p", "--pid",
-    help="trace this PID only")
+    help="trace this PID only which is the sender of signal")
+parser.add_argument("-T", "--tpid",
+    help="trace this target PID only which is the receiver of signal")
+parser.add_argument("-s", "--signal",
+    help="trace this signal only")
+parser.add_argument("--ebpf", action="store_true",
+    help=argparse.SUPPRESS)
+parser.add_argument("-j", "--json", action="store_true",
+    help="json output")
 args = parser.parse_args()
 debug = 0
 
@@ -41,14 +51,14 @@ bpf_text = """
 #include <linux/sched.h>
 
 struct val_t {
-   u64 pid;
+   u32 pid;
    int sig;
    int tpid;
    char comm[TASK_COMM_LEN];
 };
 
 struct data_t {
-   u64 pid;
+   u32 pid;
    int tpid;
    int sig;
    int ret;
@@ -58,82 +68,128 @@ struct data_t {
 BPF_HASH(infotmp, u32, struct val_t);
 BPF_PERF_OUTPUT(events);
 
-int kprobe__sys_kill(struct pt_regs *ctx, int tpid, int sig)
+int syscall__kill(struct pt_regs *ctx, int tpid, int sig)
 {
-    u32 pid = bpf_get_current_pid_tgid();
-    FILTER
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    u32 pid = pid_tgid >> 32;
+    u32 tid = (u32)pid_tgid;
+
+    TPID_FILTER
+    PID_FILTER
+    SIGNAL_FILTER
 
     struct val_t val = {.pid = pid};
     if (bpf_get_current_comm(&val.comm, sizeof(val.comm)) == 0) {
         val.tpid = tpid;
         val.sig = sig;
-        infotmp.update(&pid, &val);
+        infotmp.update(&tid, &val);
     }
 
     return 0;
 };
 
-int kretprobe__sys_kill(struct pt_regs *ctx)
+int do_ret_sys_kill(struct pt_regs *ctx)
 {
     struct data_t data = {};
     struct val_t *valp;
-    u32 pid = bpf_get_current_pid_tgid();
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    u32 pid = pid_tgid >> 32;
+    u32 tid = (u32)pid_tgid;
 
-    valp = infotmp.lookup(&pid);
+    valp = infotmp.lookup(&tid);
     if (valp == 0) {
         // missed entry
         return 0;
     }
 
-    bpf_probe_read(&data.comm, sizeof(data.comm), valp->comm);
+    bpf_probe_read_kernel(&data.comm, sizeof(data.comm), valp->comm);
     data.pid = pid;
     data.tpid = valp->tpid;
     data.ret = PT_REGS_RC(ctx);
     data.sig = valp->sig;
 
     events.perf_submit(ctx, &data, sizeof(data));
-    infotmp.delete(&pid);
+    infotmp.delete(&tid);
 
     return 0;
 }
 """
+
+if args.tpid:
+    bpf_text = bpf_text.replace('TPID_FILTER',
+        'if (tpid != %s) { return 0; }' % args.tpid)
+else:
+    bpf_text = bpf_text.replace('TPID_FILTER', '')
+
 if args.pid:
-    bpf_text = bpf_text.replace('FILTER',
+    bpf_text = bpf_text.replace('PID_FILTER',
         'if (pid != %s) { return 0; }' % args.pid)
 else:
-    bpf_text = bpf_text.replace('FILTER', '')
-if debug:
+    bpf_text = bpf_text.replace('PID_FILTER', '')
+
+if args.signal:
+    bpf_text = bpf_text.replace('SIGNAL_FILTER',
+        'if (sig != %s) { return 0; }' % args.signal)
+else:
+    bpf_text = bpf_text.replace('SIGNAL_FILTER', '')
+
+if debug or args.ebpf:
     print(bpf_text)
+    if args.ebpf:
+        exit()
 
 # initialize BPF
 b = BPF(text=bpf_text)
+kill_fnname = b.get_syscall_fnname("kill")
+b.attach_kprobe(event=kill_fnname, fn_name="syscall__kill")
+b.attach_kretprobe(event=kill_fnname, fn_name="do_ret_sys_kill")
 
-TASK_COMM_LEN = 16    # linux/sched.h
-
-class Data(ct.Structure):
-    _fields_ = [
-        ("pid", ct.c_ulonglong),
-        ("tpid", ct.c_int),
-        ("sig", ct.c_int),
-        ("ret", ct.c_int),
-        ("comm", ct.c_char * TASK_COMM_LEN)
-    ]
+# detect the length of PID column
+pid_bytes = 6
+try:
+    with open("/proc/sys/kernel/pid_max", 'r') as f:
+        pid_bytes = len(f.read().strip()) + 1
+        f.close()
+except:
+    pass # not fatal error, just use the default value
 
 # header
-print("%-9s %-6s %-16s %-4s %-6s %s" % (
-    "TIME", "PID", "COMM", "SIG", "TPID", "RESULT"))
+if not args.json:
+    print("%-9s %-*s %-16s %-4s %-*s %s" % (
+        "TIME", pid_bytes, "PID", "COMM", "SIG", pid_bytes, "TPID", "RESULT"))
 
 # process event
 def print_event(cpu, data, size):
-    event = ct.cast(data, ct.POINTER(Data)).contents
+    event = b["events"].event(data)
 
     if (args.failed and (event.ret >= 0)):
         return
 
-    print("%-9s %-6d %-16s %-4d %-6d %d" % (strftime("%H:%M:%S"),
-        event.pid, event.comm.decode(), event.sig, event.tpid, event.ret))
+    printb(b"%-9s %-*d %-16s %-4d %-*d %d" % (strftime("%H:%M:%S").encode('ascii'),
+        pid_bytes, event.pid, event.comm, event.sig, pid_bytes, event.tpid, event.ret))
+
+def print_event_json(cpu, data, size):
+    event = b["events"].event(data)
+
+    if (args.failed and (event.ret >= 0)):
+        return
+
+    print("%s" % {
+        "time": strftime("%H:%M:%S"),
+        "pid": event.pid,
+        "comm": event.comm.decode(),
+        "sig": event.sig,
+        "tpid": event.tpid,
+        "ret": event.ret,
+    })
 
 # loop with callback to print_event
-b["events"].open_perf_buffer(print_event)
+if args.json:
+    b["events"].open_perf_buffer(print_event_json)
+else:
+    b["events"].open_perf_buffer(print_event)
 while 1:
-    b.kprobe_poll()
+    try:
+        b.perf_buffer_poll()
+    except KeyboardInterrupt:
+        exit()

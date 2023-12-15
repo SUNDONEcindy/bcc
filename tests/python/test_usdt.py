@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/env python3
 #
 # USAGE: test_usdt.py
 #
@@ -56,7 +56,7 @@ int main() {
 }
 """
         # BPF program
-        self.bpf_text = """
+        self.bpf_text = b"""
 #include <linux/blkdev.h>
 #include <uapi/linux/ptrace.h>
 
@@ -132,7 +132,7 @@ int do_trace5(struct pt_regs *ctx) {
         self.ftemp = NamedTemporaryFile(delete=False)
         self.ftemp.close()
         comp = Popen(["gcc", "-I", "%s/include" % os.path.dirname(os.path.abspath(inspect.getfile(inspect.currentframe()))),
-                      "-x", "c", "-o", self.ftemp.name, "-"],
+                      "-x", "c++", "-o", self.ftemp.name, "-"],
                      stdin=PIPE)
         comp.stdin.write(app_text)
         comp.stdin.close()
@@ -205,15 +205,15 @@ int do_trace5(struct pt_regs *ctx) {
             print("%s" % event.v1)
 
         # loop with callback to print_event
-        b["event1"].open_perf_buffer(print_event1)
-        b["event2"].open_perf_buffer(print_event2)
-        b["event3"].open_perf_buffer(print_event3)
-        b["event4"].open_perf_buffer(print_event4)
-        b["event5"].open_perf_buffer(print_event5)
+        b[b"event1"].open_perf_buffer(print_event1)
+        b[b"event2"].open_perf_buffer(print_event2)
+        b[b"event3"].open_perf_buffer(print_event3)
+        b[b"event4"].open_perf_buffer(print_event4)
+        b[b"event5"].open_perf_buffer(print_event5)
 
         # three iterations to make sure we get some probes and have time to process them
         for i in range(3):
-            b.kprobe_poll()
+            b.perf_buffer_poll()
         self.assertTrue(self.evt_st_1 == 1 and self.evt_st_2 == 1 and self.evt_st_3 == 1)
 
     def tearDown(self):

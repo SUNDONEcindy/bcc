@@ -22,7 +22,7 @@ extern "C" {
 
 #include <stdint.h>
 
-void *bcc_usdt_new_frompid(int pid);
+void *bcc_usdt_new_frompid(int pid, const char *path);
 void *bcc_usdt_new_frompath(const char *path);
 void bcc_usdt_close(void *usdt);
 
@@ -30,13 +30,17 @@ struct bcc_usdt {
     const char *provider;
     const char *name;
     const char *bin_path;
+    // Virtual address semaphore is found at
     uint64_t semaphore;
     int num_locations;
     int num_arguments;
+    // Offset from start of file where semaphore is at
+    uint64_t semaphore_offset;
 };
 
 struct bcc_usdt_location {
     uint64_t address;
+    const char *bin_path;
 };
 
 #define BCC_USDT_ARGUMENT_NONE                0x0
@@ -50,7 +54,7 @@ struct bcc_usdt_location {
 struct bcc_usdt_argument {
     int size;
     int valid;
-    int constant;
+    long long constant;
     int deref_offset;
     const char *deref_ident;
     const char *base_register_name;
@@ -60,16 +64,27 @@ struct bcc_usdt_argument {
 
 typedef void (*bcc_usdt_cb)(struct bcc_usdt *);
 void bcc_usdt_foreach(void *usdt, bcc_usdt_cb callback);
-int bcc_usdt_get_location(void *usdt, const char *probe_name,
+int bcc_usdt_get_location(void *usdt, const char *provider_name,
+                          const char *probe_name,
                           int index, struct bcc_usdt_location *location);
-int bcc_usdt_get_argument(void *usdt, const char *probe_name,
+int bcc_usdt_get_argument(void *usdt, const char *provider_name,
+                          const char *probe_name,
                           int location_index, int argument_index,
                           struct bcc_usdt_argument *argument);
 
 int bcc_usdt_enable_probe(void *, const char *, const char *);
+int bcc_usdt_addsem_probe(void *, const char *, const char *, int16_t);
+#define BCC_USDT_HAS_FULLY_SPECIFIED_PROBE
+int bcc_usdt_enable_fully_specified_probe(void *, const char *, const char *,
+                                          const char *);
+int bcc_usdt_addsem_fully_specified_probe(void *, const char *, const char *,
+                                          const char *, int16_t);
 const char *bcc_usdt_genargs(void **ctx_array, int len);
 const char *bcc_usdt_get_probe_argctype(
   void *ctx, const char* probe_name, const int arg_index
+);
+const char *bcc_usdt_get_fully_specified_probe_argctype(
+  void *ctx, const char* provider_name, const char* probe_name, const int arg_index
 );
 
 typedef void (*bcc_usdt_uprobe_cb)(const char *, const char *, uint64_t, int);

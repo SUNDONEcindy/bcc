@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/env python
 #
 # bpflist   Display processes currently using BPF programs and maps,
 #           pinned BPF programs and maps, and enabled probes.
@@ -40,7 +40,8 @@ def comm_for_pid(pid):
 counts = {}
 
 def parse_probes(typ):
-    if args.verbosity > 1: print("open %ss:" % typ)
+    if args.verbosity > 1:
+        print("open %ss:" % typ)
     for probe in open("/sys/kernel/debug/tracing/%s_events" % typ):
         # Probes opened by bcc have a specific pattern that includes the pid
         # of the requesting process.
@@ -48,8 +49,10 @@ def parse_probes(typ):
         if match:
             pid = int(match.group(1))
             counts[(pid, typ)] = counts.get((pid, typ), 0) + 1
-        if args.verbosity > 1: print(probe.strip())
-    if args.verbosity > 1: print("")
+        if args.verbosity > 1:
+            print(probe.strip())
+    if args.verbosity > 1:
+        print("")
 
 if args.verbosity > 0:
     parse_probes("kprobe")
@@ -62,16 +65,23 @@ def find_bpf_fds(pid):
             link = os.readlink(os.path.join(root, fd))
         except OSError:
             continue
-        match = re.match('.*bpf-(\\w+)', link)
+        match = re.match('anon_inode:bpf-([\\w-]+)', link)
         if match:
             tup = (pid, match.group(1))
             counts[tup] = counts.get(tup, 0) + 1
 
 for pdir in os.listdir('/proc'):
     if re.match('\\d+', pdir):
-        find_bpf_fds(int(pdir))
+        try:
+            find_bpf_fds(int(pdir))
+        except OSError:
+            continue
 
-print("%-6s %-16s %-8s %s" % ("PID", "COMM", "TYPE", "COUNT"))
-for (pid, typ), count in sorted(counts.items(), key=lambda t: t[0][0]):
+items = counts.items()
+max_type_len = items and max(list(map(lambda t: len(t[0][1]), items))) or 0
+print_format = "%%-6s %%-16s %%-%ss %%s" % (max_type_len + 1)
+
+print(print_format % ("PID", "COMM", "TYPE", "COUNT"))
+for (pid, typ), count in sorted(items, key=lambda t: t[0][0]):
     comm = comm_for_pid(pid)
-    print("%-6d %-16s %-8s %-4d" % (pid, comm, typ, count))
+    print(print_format % (pid, comm, typ, count))

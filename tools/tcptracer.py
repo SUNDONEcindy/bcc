@@ -1,9 +1,9 @@
-#!/usr/bin/python
+#!/usr/bin/env python
 #
 # tcpv4tracer   Trace TCP connections.
 #               For Linux, uses BCC, eBPF. Embedded C.
 #
-# USAGE: tcpv4tracer [-h] [-v] [-p PID] [-N NETNS]
+# USAGE: tcpv4tracer [-h] [-v] [-p PID] [-N NETNS] [-4 | -6]
 #
 # You should generally try to avoid writing long scripts that measure multiple
 # functions and walk multiple kernel structures, as they will be a burden to
@@ -11,16 +11,17 @@
 # The following code should be replaced, and simplified, when static TCP probes
 # exist.
 #
-# Copyright 2017 Kinvolk GmbH
+# Copyright 2017-2020 Kinvolk GmbH
 #
 # Licensed under the Apache License, Version 2.0 (the "License")
 from __future__ import print_function
 from bcc import BPF
+from bcc.containers import filter_by_containers
 
 import argparse as ap
-import ctypes
 from socket import inet_ntop, AF_INET, AF_INET6
 from struct import pack
+import json
 
 parser = ap.ArgumentParser(description="Trace TCP connections",
                            formatter_class=ap.RawDescriptionHelpFormatter)
@@ -30,8 +31,21 @@ parser.add_argument("-p", "--pid", default=0, type=int,
                     help="trace this PID only")
 parser.add_argument("-N", "--netns", default=0, type=int,
                     help="trace this Network Namespace only")
+parser.add_argument("--cgroupmap",
+                    help="trace cgroups in this BPF map only")
+parser.add_argument("--mntnsmap",
+                    help="trace mount namespaces in this BPF map only")
+parser.add_argument("-j", "--json", action="store_true",
+                    help="json output")
+group = parser.add_mutually_exclusive_group()
+group.add_argument("-4", "--ipv4", action="store_true",
+                    help="trace IPv4 family only")
+group.add_argument("-6", "--ipv6", action="store_true",
+                   help="trace IPv6 family only")
 parser.add_argument("-v", "--verbose", action="store_true",
                     help="include Network Namespace in the output")
+parser.add_argument("--ebpf", action="store_true",
+                    help=ap.SUPPRESS)
 args = parser.parse_args()
 
 bpf_text = """
@@ -67,12 +81,12 @@ struct tcp_ipv6_event_t {
     u32 type;
     u32 pid;
     char comm[TASK_COMM_LEN];
-    u8 ip;
     unsigned __int128 saddr;
     unsigned __int128 daddr;
     u16 sport;
     u16 dport;
     u32 netns;
+    u8 ip;
 };
 BPF_PERF_OUTPUT(tcp_ipv6_event);
 
@@ -107,20 +121,14 @@ BPF_HASH(connectsock, u64, struct sock *);
 
 static int read_ipv4_tuple(struct ipv4_tuple_t *tuple, struct sock *skp)
 {
-  u32 saddr = 0, daddr = 0, net_ns_inum = 0;
-  u16 sport = 0, dport = 0;
-  possible_net_t skc_net;
-
-  bpf_probe_read(&saddr, sizeof(saddr), &skp->__sk_common.skc_rcv_saddr);
-  bpf_probe_read(&daddr, sizeof(daddr), &skp->__sk_common.skc_daddr);
-  bpf_probe_read(&sport, sizeof(sport),
-                 &((struct inet_sock *)skp)->inet_sport);
-  bpf_probe_read(&dport, sizeof(dport), &skp->__sk_common.skc_dport);
+  u32 net_ns_inum = 0;
+  u32 saddr = skp->__sk_common.skc_rcv_saddr;
+  u32 daddr = skp->__sk_common.skc_daddr;
+  struct inet_sock *sockp = (struct inet_sock *)skp;
+  u16 sport = sockp->inet_sport;
+  u16 dport = skp->__sk_common.skc_dport;
 #ifdef CONFIG_NET_NS
-  bpf_probe_read(&skc_net, sizeof(skc_net), &skp->__sk_common.skc_net);
-  bpf_probe_read(&net_ns_inum, sizeof(net_ns_inum), &skc_net.net->ns.inum);
-#else
-  net_ns_inum = 0;
+  net_ns_inum = skp->__sk_common.skc_net.net->ns.inum;
 #endif
 
   ##FILTER_NETNS##
@@ -142,23 +150,17 @@ static int read_ipv4_tuple(struct ipv4_tuple_t *tuple, struct sock *skp)
 static int read_ipv6_tuple(struct ipv6_tuple_t *tuple, struct sock *skp)
 {
   u32 net_ns_inum = 0;
-  u16 sport = 0, dport = 0;
   unsigned __int128 saddr = 0, daddr = 0;
-  possible_net_t skc_net;
-
-  bpf_probe_read(&sport, sizeof(sport),
-                 &((struct inet_sock *)skp)->inet_sport);
-  bpf_probe_read(&dport, sizeof(dport), &skp->__sk_common.skc_dport);
-  bpf_probe_read(&saddr, sizeof(saddr),
-                 &skp->__sk_common.skc_v6_rcv_saddr.in6_u.u6_addr32);
-  bpf_probe_read(&daddr, sizeof(daddr),
-                 &skp->__sk_common.skc_v6_daddr.in6_u.u6_addr32);
+  struct inet_sock *sockp = (struct inet_sock *)skp;
+  u16 sport = sockp->inet_sport;
+  u16 dport = skp->__sk_common.skc_dport;
 #ifdef CONFIG_NET_NS
-  bpf_probe_read(&skc_net, sizeof(skc_net), &skp->__sk_common.skc_net);
-  bpf_probe_read(&net_ns_inum, sizeof(net_ns_inum), &skc_net.net->ns.inum);
-#else
-  net_ns_inum = 0;
+  net_ns_inum = skp->__sk_common.skc_net.net->ns.inum;
 #endif
+  bpf_probe_read_kernel(&saddr, sizeof(saddr),
+                 skp->__sk_common.skc_v6_rcv_saddr.in6_u.u6_addr32);
+  bpf_probe_read_kernel(&daddr, sizeof(daddr),
+                 skp->__sk_common.skc_v6_daddr.in6_u.u6_addr32);
 
   ##FILTER_NETNS##
 
@@ -178,18 +180,23 @@ static int read_ipv6_tuple(struct ipv6_tuple_t *tuple, struct sock *skp)
 
 static bool check_family(struct sock *sk, u16 expected_family) {
   u64 zero = 0;
-  u16 family = 0;
-
-  bpf_probe_read(&family, sizeof(family), &sk->__sk_common.skc_family);
-
+  u16 family = sk->__sk_common.skc_family;
   return family == expected_family;
 }
 
 int trace_connect_v4_entry(struct pt_regs *ctx, struct sock *sk)
 {
+  if (container_should_be_filtered()) {
+    return 0;
+  }
+
   u64 pid = bpf_get_current_pid_tgid();
 
   ##FILTER_PID##
+  
+  u16 family = sk->__sk_common.skc_family;
+  ##FILTER_FAMILY##
+
 
   // stash the sock ptr for lookup on return
   connectsock.update(&pid, &sk);
@@ -234,9 +241,14 @@ int trace_connect_v4_return(struct pt_regs *ctx)
 
 int trace_connect_v6_entry(struct pt_regs *ctx, struct sock *sk)
 {
+  if (container_should_be_filtered()) {
+    return 0;
+  }
   u64 pid = bpf_get_current_pid_tgid();
 
   ##FILTER_PID##
+  u16 family = sk->__sk_common.skc_family;
+  ##FILTER_FAMILY##
 
   // stash the sock ptr for lookup on return
   connectsock.update(&pid, &sk);
@@ -279,15 +291,15 @@ int trace_connect_v6_return(struct pt_regs *ctx)
   return 0;
 }
 
-int trace_tcp_set_state_entry(struct pt_regs *ctx, struct sock *sk, int state)
+int trace_tcp_set_state_entry(struct pt_regs *ctx, struct sock *skp, int state)
 {
   if (state != TCP_ESTABLISHED && state != TCP_CLOSE) {
       return 0;
   }
 
-  struct sock *skp;
-  bpf_probe_read(&skp, sizeof(struct sock *), &sk);
-
+  u16 family = skp->__sk_common.skc_family;
+  ##FILTER_FAMILY##
+  
   u8 ipver = 0;
   if (check_family(skp, AF_INET)) {
       ipver = 4;
@@ -367,18 +379,20 @@ int trace_tcp_set_state_entry(struct pt_regs *ctx, struct sock *sk, int state)
   return 0;
 }
 
-int trace_close_entry(struct pt_regs *ctx, struct sock *sk)
+int trace_close_entry(struct pt_regs *ctx, struct sock *skp)
 {
+  if (container_should_be_filtered()) {
+    return 0;
+  }
+
   u64 pid = bpf_get_current_pid_tgid();
 
   ##FILTER_PID##
+  
+  u16 family = skp->__sk_common.skc_family;
+  ##FILTER_FAMILY##
 
-  // pull in details
-  struct sock *skp;
-  bpf_probe_read(&skp, sizeof(struct sock *), &sk);
-
-  u8 oldstate = 0;
-  bpf_probe_read(&oldstate, sizeof(oldstate), (u8 *)&skp->sk_state);
+  u8 oldstate = skp->sk_state;
   // Don't generate close events for connections that were never
   // established in the first place.
   if (oldstate == TCP_SYN_SENT ||
@@ -435,6 +449,10 @@ int trace_close_entry(struct pt_regs *ctx, struct sock *sk)
 
 int trace_accept_return(struct pt_regs *ctx)
 {
+  if (container_should_be_filtered()) {
+    return 0;
+  }
+
   struct sock *newsk = (struct sock *)PT_REGS_RC(ctx);
   u64 pid = bpf_get_current_pid_tgid();
 
@@ -449,19 +467,18 @@ int trace_accept_return(struct pt_regs *ctx)
   u32 net_ns_inum = 0;
   u8 ipver = 0;
 
-  bpf_probe_read(&dport, sizeof(dport), &newsk->__sk_common.skc_dport);
-  bpf_probe_read(&lport, sizeof(lport), &newsk->__sk_common.skc_num);
+  dport = newsk->__sk_common.skc_dport;
+  lport = newsk->__sk_common.skc_num;
 
   // Get network namespace id, if kernel supports it
 #ifdef CONFIG_NET_NS
-  possible_net_t skc_net;
-  bpf_probe_read(&skc_net, sizeof(skc_net), &newsk->__sk_common.skc_net);
-  bpf_probe_read(&net_ns_inum, sizeof(net_ns_inum), &skc_net.net->ns.inum);
-#else
-  net_ns_inum = 0;
+  net_ns_inum = newsk->__sk_common.skc_net.net->ns.inum;
 #endif
 
   ##FILTER_NETNS##
+  
+  u16 family = newsk->__sk_common.skc_family;
+  ##FILTER_FAMILY##
 
   if (check_family(newsk, AF_INET)) {
       ipver = 4;
@@ -474,10 +491,8 @@ int trace_accept_return(struct pt_regs *ctx)
       evt4.pid = pid >> 32;
       evt4.ip = ipver;
 
-      bpf_probe_read(&evt4.saddr, sizeof(evt4.saddr),
-                     &newsk->__sk_common.skc_rcv_saddr);
-      bpf_probe_read(&evt4.daddr, sizeof(evt4.daddr),
-                     &newsk->__sk_common.skc_daddr);
+      evt4.saddr = newsk->__sk_common.skc_rcv_saddr;
+      evt4.daddr = newsk->__sk_common.skc_daddr;
 
       evt4.sport = lport;
       evt4.dport = ntohs(dport);
@@ -499,10 +514,10 @@ int trace_accept_return(struct pt_regs *ctx)
       evt6.pid = pid >> 32;
       evt6.ip = ipver;
 
-      bpf_probe_read(&evt6.saddr, sizeof(evt6.saddr),
-                     &newsk->__sk_common.skc_v6_rcv_saddr.in6_u.u6_addr32);
-      bpf_probe_read(&evt6.daddr, sizeof(evt6.daddr),
-                     &newsk->__sk_common.skc_v6_daddr.in6_u.u6_addr32);
+      bpf_probe_read_kernel(&evt6.saddr, sizeof(evt6.saddr),
+                     newsk->__sk_common.skc_v6_rcv_saddr.in6_u.u6_addr32);
+      bpf_probe_read_kernel(&evt6.daddr, sizeof(evt6.daddr),
+                     newsk->__sk_common.skc_v6_daddr.in6_u.u6_addr32);
 
       evt6.sport = lport;
       evt6.dport = ntohs(dport);
@@ -520,45 +535,12 @@ int trace_accept_return(struct pt_regs *ctx)
 }
 """
 
-TASK_COMM_LEN = 16   # linux/sched.h
-
-
-class TCPIPV4Evt(ctypes.Structure):
-    _fields_ = [
-            ("ts_ns", ctypes.c_ulonglong),
-            ("type", ctypes.c_uint),
-            ("pid", ctypes.c_uint),
-            ("comm", ctypes.c_char * TASK_COMM_LEN),
-            ("ip", ctypes.c_ubyte),
-            ("saddr", ctypes.c_uint),
-            ("daddr", ctypes.c_uint),
-            ("sport", ctypes.c_ushort),
-            ("dport", ctypes.c_ushort),
-            ("netns", ctypes.c_uint)
-    ]
-
-
-class TCPIPV6Evt(ctypes.Structure):
-    _fields_ = [
-            ("ts_ns", ctypes.c_ulonglong),
-            ("type", ctypes.c_uint),
-            ("pid", ctypes.c_uint),
-            ("comm", ctypes.c_char * TASK_COMM_LEN),
-            ("ip", ctypes.c_ubyte),
-            ("saddr", (ctypes.c_ulong * 2)),
-            ("daddr", (ctypes.c_ulong * 2)),
-            ("sport", ctypes.c_ushort),
-            ("dport", ctypes.c_ushort),
-            ("netns", ctypes.c_uint)
-    ]
-
-
 verbose_types = {"C": "connect", "A": "accept",
                  "X": "close", "U": "unknown"}
 
 
 def print_ipv4_event(cpu, data, size):
-    event = ctypes.cast(data, ctypes.POINTER(TCPIPV4Evt)).contents
+    event = b["tcp_ipv4_event"].event(data)
     global start_ts
 
     if args.timestamp:
@@ -567,7 +549,7 @@ def print_ipv4_event(cpu, data, size):
         if args.verbose:
             print("%-14d" % (event.ts_ns - start_ts), end="")
         else:
-            print("%-9.3f" % ((float(event.ts_ns) - start_ts) / 1000000000), end="")
+            print("%-9.3f" % ((event.ts_ns - start_ts) / 1000000000.0), end="")
     if event.type == 1:
         type_str = "C"
     elif event.type == 2:
@@ -583,7 +565,7 @@ def print_ipv4_event(cpu, data, size):
         print("%-2s " % (type_str), end="")
 
     print("%-6d %-16s %-2d %-16s %-16s %-6d %-6d" %
-          (event.pid, event.comm.decode('utf-8'),
+          (event.pid, event.comm.decode('utf-8', 'replace'),
            event.ip,
            inet_ntop(AF_INET, pack("I", event.saddr)),
            inet_ntop(AF_INET, pack("I", event.daddr)),
@@ -596,7 +578,7 @@ def print_ipv4_event(cpu, data, size):
 
 
 def print_ipv6_event(cpu, data, size):
-    event = ctypes.cast(data, ctypes.POINTER(TCPIPV6Evt)).contents
+    event = b["tcp_ipv6_event"].event(data)
     global start_ts
     if args.timestamp:
         if start_ts == 0:
@@ -604,7 +586,7 @@ def print_ipv6_event(cpu, data, size):
         if args.verbose:
             print("%-14d" % (event.ts_ns - start_ts), end="")
         else:
-            print("%-9.3f" % ((float(event.ts_ns) - start_ts) / 1000000000), end="")
+            print("%-9.3f" % ((event.ts_ns - start_ts) / 1000000000.0), end="")
     if event.type == 1:
         type_str = "C"
     elif event.type == 2:
@@ -620,10 +602,10 @@ def print_ipv6_event(cpu, data, size):
         print("%-2s " % (type_str), end="")
 
     print("%-6d %-16s %-2d %-16s %-16s %-6d %-6d" %
-          (event.pid, event.comm.decode('utf-8'),
+          (event.pid, event.comm.decode('utf-8', 'replace'),
            event.ip,
-           "["+inet_ntop(AF_INET6, event.saddr)+"]",
-           "["+inet_ntop(AF_INET6, event.daddr)+"]",
+           "[" + inet_ntop(AF_INET6, event.saddr) + "]",
+           "[" + inet_ntop(AF_INET6, event.daddr) + "]",
            event.sport,
            event.dport), end="")
     if args.verbose and not args.netns:
@@ -631,6 +613,63 @@ def print_ipv6_event(cpu, data, size):
     else:
         print()
 
+def print_ipv4_event_json(cpu, data, size):
+    event = b["tcp_ipv4_event"].event(data)
+    global start_ts
+
+    if start_ts == 0:
+        start_ts = event.ts_ns
+
+    if event.type == 1:
+        type_str = "C"
+    elif event.type == 2:
+        type_str = "A"
+    elif event.type == 3:
+        type_str = "X"
+    else:
+        type_str = "U"
+
+    print(json.dumps({
+        "timestamp": ((event.ts_ns - start_ts) / 1000000000.0),
+        "type": verbose_types[type_str],
+        "pid": event.pid,
+        "comm": event.comm.decode('utf-8', 'replace'),
+        "ip": event.ip,
+        "saddr": inet_ntop(AF_INET, pack("I", event.saddr)),
+        "daddr": inet_ntop(AF_INET, pack("I", event.daddr)),
+        "sport": event.sport,
+        "dport": event.dport,
+        "netns": event.netns
+    }))
+
+def print_ipv6_event_json(cpu, data, size):
+    event = b["tcp_ipv6_event"].event(data)
+    global start_ts
+
+    if start_ts == 0:
+        start_ts = event.ts_ns
+
+    if event.type == 1:
+        type_str = "C"
+    elif event.type == 2:
+        type_str = "A"
+    elif event.type == 3:
+        type_str = "X"
+    else:
+        type_str = "U"
+
+    print(json.dumps({
+        "timestamp": ((event.ts_ns - start_ts) / 1000000000.0),
+        "type": verbose_types[type_str],
+        "pid": event.pid,
+        "comm": event.comm.decode('utf-8', 'replace'),
+        "ip": event.ip,
+        "saddr": inet_ntop(AF_INET6, event.saddr),
+        "daddr": inet_ntop(AF_INET6, event.daddr),
+        "sport": event.sport,
+        "dport": event.dport,
+        "netns": event.netns
+    }))
 
 pid_filter = ""
 netns_filter = ""
@@ -639,36 +678,56 @@ if args.pid:
     pid_filter = 'if (pid >> 32 != %d) { return 0; }' % args.pid
 if args.netns:
     netns_filter = 'if (net_ns_inum != %d) { return 0; }' % args.netns
-
+if args.ipv4:
+    bpf_text = bpf_text.replace('##FILTER_FAMILY##',
+        'if (family != AF_INET) { return 0; }')
+elif args.ipv6:
+    bpf_text = bpf_text.replace('##FILTER_FAMILY##',
+        'if (family != AF_INET6) { return 0; }')
+bpf_text = bpf_text.replace('##FILTER_FAMILY##', '')
 bpf_text = bpf_text.replace('##FILTER_PID##', pid_filter)
 bpf_text = bpf_text.replace('##FILTER_NETNS##', netns_filter)
+bpf_text = filter_by_containers(args) + bpf_text
+
+if args.ebpf:
+    print(bpf_text)
+    exit()
 
 # initialize BPF
 b = BPF(text=bpf_text)
-b.attach_kprobe(event="tcp_v4_connect", fn_name="trace_connect_v4_entry")
-b.attach_kretprobe(event="tcp_v4_connect", fn_name="trace_connect_v4_return")
-b.attach_kprobe(event="tcp_v6_connect", fn_name="trace_connect_v6_entry")
-b.attach_kretprobe(event="tcp_v6_connect", fn_name="trace_connect_v6_return")
+if args.ipv4:
+    b.attach_kprobe(event="tcp_v4_connect", fn_name="trace_connect_v4_entry")
+    b.attach_kretprobe(event="tcp_v4_connect", fn_name="trace_connect_v4_return")
+elif args.ipv6:
+    b.attach_kprobe(event="tcp_v6_connect", fn_name="trace_connect_v6_entry")
+    b.attach_kretprobe(event="tcp_v6_connect", fn_name="trace_connect_v6_return")
+else:
+    b.attach_kprobe(event="tcp_v4_connect", fn_name="trace_connect_v4_entry")
+    b.attach_kretprobe(event="tcp_v4_connect", fn_name="trace_connect_v4_return")
+    b.attach_kprobe(event="tcp_v6_connect", fn_name="trace_connect_v6_entry")
+    b.attach_kretprobe(event="tcp_v6_connect", fn_name="trace_connect_v6_return")
 b.attach_kprobe(event="tcp_set_state", fn_name="trace_tcp_set_state_entry")
 b.attach_kprobe(event="tcp_close", fn_name="trace_close_entry")
 b.attach_kretprobe(event="inet_csk_accept", fn_name="trace_accept_return")
 
-print("Tracing TCP established connections. Ctrl-C to end.")
+if not args.json:
+    print("Tracing TCP established connections. Ctrl-C to end.")
 
 # header
-if args.verbose:
-    if args.timestamp:
-        print("%-14s" % ("TIME(ns)"), end="")
-    print("%-12s %-6s %-16s %-2s %-16s %-16s %-6s %-7s" % ("TYPE",
-          "PID", "COMM", "IP", "SADDR", "DADDR", "SPORT", "DPORT"), end="")
-    if not args.netns:
-        print("%-8s" % "NETNS", end="")
-    print()
-else:
-    if args.timestamp:
-        print("%-9s" % ("TIME(s)"), end="")
-    print("%-2s %-6s %-16s %-2s %-16s %-16s %-6s %-6s" %
-          ("T", "PID", "COMM", "IP", "SADDR", "DADDR", "SPORT", "DPORT"))
+if not args.json:
+    if args.verbose:
+        if args.timestamp:
+            print("%-14s" % ("TIME(ns)"), end="")
+        print("%-12s %-6s %-16s %-2s %-16s %-16s %-6s %-7s" % ("TYPE",
+            "PID", "COMM", "IP", "SADDR", "DADDR", "SPORT", "DPORT"), end="")
+        if not args.netns:
+            print("%-8s" % "NETNS", end="")
+        print()
+    else:
+        if args.timestamp:
+            print("%-9s" % ("TIME(s)"), end="")
+        print("%-2s %-6s %-16s %-2s %-16s %-16s %-6s %-6s" %
+            ("T", "PID", "COMM", "IP", "SADDR", "DADDR", "SPORT", "DPORT"))
 
 start_ts = 0
 
@@ -681,8 +740,14 @@ def inet_ntoa(addr):
         addr = addr >> 8
     return dq
 
-
-b["tcp_ipv4_event"].open_perf_buffer(print_ipv4_event)
-b["tcp_ipv6_event"].open_perf_buffer(print_ipv6_event)
+if args.json:
+    b["tcp_ipv4_event"].open_perf_buffer(print_ipv4_event_json)
+    b["tcp_ipv6_event"].open_perf_buffer(print_ipv6_event_json)
+else:
+    b["tcp_ipv4_event"].open_perf_buffer(print_ipv4_event)
+    b["tcp_ipv6_event"].open_perf_buffer(print_ipv6_event)
 while True:
-    b.kprobe_poll()
+    try:
+        b.perf_buffer_poll()
+    except KeyboardInterrupt:
+        exit()

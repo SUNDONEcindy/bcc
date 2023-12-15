@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # Copyright (c) PLUMgrid, Inc.
 # Licensed under the Apache License, Version 2.0 (the "License")
 
@@ -65,6 +65,7 @@ from ctypes import c_uint
 from netaddr import IPAddress, EUI
 from bcc import BPF
 from pyroute2 import IPRoute, NetNS, IPDB, NSPopen
+from utils import NSPopenWithCheck, skipUnlessHasBinaries
 import sys
 from time import sleep
 from unittest import main, TestCase
@@ -88,20 +89,20 @@ class TestBPFSocket(TestCase):
         self.vm2_rtr_mask   = "200.1.1.0/24"
 
     def get_table(self, b):
-        self.jump = b.get_table("jump")
+        self.jump = b.get_table(b"jump")
 
-        self.pem_dest = b.get_table("pem_dest")
-        self.pem_port = b.get_table("pem_port")
-        self.pem_ifindex = b.get_table("pem_ifindex")
-        self.pem_stats = b.get_table("pem_stats")
+        self.pem_dest = b.get_table(b"pem_dest")
+        self.pem_port = b.get_table(b"pem_port")
+        self.pem_ifindex = b.get_table(b"pem_ifindex")
+        self.pem_stats = b.get_table(b"pem_stats")
 
-        self.br1_dest = b.get_table("br1_dest")
-        self.br1_mac = b.get_table("br1_mac")
-        self.br1_rtr = b.get_table("br1_rtr")
+        self.br1_dest = b.get_table(b"br1_dest")
+        self.br1_mac = b.get_table(b"br1_mac")
+        self.br1_rtr = b.get_table(b"br1_rtr")
 
-        self.br2_dest = b.get_table("br2_dest")
-        self.br2_mac = b.get_table("br2_mac")
-        self.br2_rtr = b.get_table("br2_rtr")
+        self.br2_dest = b.get_table(b"br2_dest")
+        self.br2_mac = b.get_table(b"br2_mac")
+        self.br2_rtr = b.get_table(b"br2_rtr")
 
     def connect_ports(self, prog_id_pem, prog_id_br, curr_pem_pid, curr_br_pid,
                       br_dest_map, br_mac_map, ifindex, vm_mac, vm_ip):
@@ -146,12 +147,15 @@ class TestBPFSocket(TestCase):
         self.br1_rtr[c_uint(0)] = c_uint(self.nsrtr_eth0_out.index)
         self.br2_rtr[c_uint(0)] = c_uint(self.nsrtr_eth1_out.index)
 
+    @skipUnlessHasBinaries(
+        ["arping", "iperf", "netperf", "netserver", "ping"],
+        "iperf and netperf packages must be installed.")
     def test_brb(self):
         try:
-            b = BPF(src_file=arg1, debug=0)
-            self.pem_fn = b.load_func("pem", BPF.SCHED_CLS)
-            self.br1_fn = b.load_func("br1", BPF.SCHED_CLS)
-            self.br2_fn = b.load_func("br2", BPF.SCHED_CLS)
+            b = BPF(src_file=arg1.encode(), debug=0)
+            self.pem_fn = b.load_func(b"pem", BPF.SCHED_CLS)
+            self.br1_fn = b.load_func(b"br1", BPF.SCHED_CLS)
+            self.br2_fn = b.load_func(b"br2", BPF.SCHED_CLS)
             self.get_table(b)
 
             # set up the topology
@@ -196,15 +200,15 @@ class TestBPFSocket(TestCase):
             # total 8 packets should be counted
             self.assertEqual(self.pem_stats[c_uint(0)].value, 8)
 
-            nsp_server = NSPopen(ns2_ipdb.nl.netns, ["iperf", "-s", "-xSC"])
+            nsp_server = NSPopenWithCheck(ns2_ipdb.nl.netns, ["iperf", "-s", "-xSC"])
             sleep(1)
             nsp = NSPopen(ns1_ipdb.nl.netns, ["iperf", "-c", self.vm2_ip, "-t", "1", "-xSC"])
             nsp.wait(); nsp.release()
             nsp_server.kill(); nsp_server.wait(); nsp_server.release()
 
-            nsp_server = NSPopen(ns2_ipdb.nl.netns, ["netserver", "-D"])
+            nsp_server = NSPopenWithCheck(ns2_ipdb.nl.netns, ["netserver", "-D"])
             sleep(1)
-            nsp = NSPopen(ns1_ipdb.nl.netns, ["netperf", "-l", "1", "-H", self.vm2_ip, "--", "-m", "65160"])
+            nsp = NSPopenWithCheck(ns1_ipdb.nl.netns, ["netperf", "-l", "1", "-H", self.vm2_ip, "--", "-m", "65160"])
             nsp.wait(); nsp.release()
             nsp = NSPopen(ns1_ipdb.nl.netns, ["netperf", "-l", "1", "-H", self.vm2_ip, "-t", "TCP_RR"])
             nsp.wait(); nsp.release()

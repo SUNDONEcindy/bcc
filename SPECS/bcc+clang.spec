@@ -1,5 +1,6 @@
 %define debug_package %{nil}
-%define llvmver 3.7.1
+%define _unpackaged_files_terminate_build 0
+%define llvmver 7.0.1
 
 Name:           bcc
 Version:        @REVISION@
@@ -96,5 +97,6 @@ Command line tools for BPF Compiler Collection (BCC)
 %exclude /usr/share/bcc/examples/*/*/*.pyo
 
 %files -n bcc-tools
+/usr/share/bcc/introspection/*
 /usr/share/bcc/tools/*
 /usr/share/bcc/man/*

@@ -28,6 +28,9 @@ Print usage message.
 \-c SAMPLE_PERIOD
 Sample one in this many cache reference and cache miss events.
 .TP
+\-t
+Summarize cache references and misses by PID/TID
+.TP
 duration
 Duration to trace, in seconds.
 .SH EXAMPLES
@@ -67,3 +70,8 @@ Linux
 Unstable - in development.
 .SH AUTHOR
 Teng Qin
+.SH SEE ALSO
+.TP
+Perf can be used as a generic event counter tool. An example for LLC:
+#
+.B perf top -e cache-misses -e cache-references -a -ns pid,cpu,comm

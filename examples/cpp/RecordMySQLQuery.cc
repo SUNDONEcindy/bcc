@@ -34,7 +34,7 @@ int probe_mysql_query(struct pt_regs *ctx, void* thd, char* query, size_t len) {
     key.ts = bpf_ktime_get_ns();
     key.pid = bpf_get_current_pid_tgid();
 
-    bpf_probe_read_str(&key.query, sizeof(key.query), query);
+    bpf_probe_read_user_str(&key.query, sizeof(key.query), query);
 
     int one = 1;
     queries.update(&key, &one);
@@ -63,14 +63,14 @@ int main(int argc, char** argv) {
 
   ebpf::BPF bpf;
   auto init_res = bpf.init(BPF_PROGRAM);
-  if (init_res.code() != 0) {
+  if (!init_res.ok()) {
     std::cerr << init_res.msg() << std::endl;
     return 1;
   }
 
   auto attach_res =
       bpf.attach_uprobe(mysql_path, ALLOC_QUERY_FUNC, "probe_mysql_query");
-  if (attach_res.code() != 0) {
+  if (!attach_res.ok()) {
     std::cerr << attach_res.msg() << std::endl;
     return 1;
   }
@@ -83,10 +83,11 @@ int main(int argc, char** argv) {
 
   auto table_handle = bpf.get_hash_table<query_probe_t, int>("queries");
   auto table = table_handle.get_table_offline();
-  std::sort(table.begin(), table.end(), [](std::pair<query_probe_t, int> a,
-                                           std::pair<query_probe_t, int> b) {
-    return a.first.ts < b.first.ts;
-  });
+  std::sort(
+      table.begin(), table.end(),
+      [](std::pair<query_probe_t, int> a, std::pair<query_probe_t, int> b) {
+        return a.first.ts < b.first.ts;
+      });
   std::cout << table.size() << " queries recorded:" << std::endl;
   for (auto it : table) {
     std::cout << "Time: " << it.first.ts << " PID: " << it.first.pid
@@ -94,7 +95,7 @@ int main(int argc, char** argv) {
   }
 
   auto detach_res = bpf.detach_uprobe(mysql_path, ALLOC_QUERY_FUNC);
-  if (detach_res.code() != 0) {
+  if (!detach_res.ok()) {
     std::cerr << detach_res.msg() << std::endl;
     return 1;
   }

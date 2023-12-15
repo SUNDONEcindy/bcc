@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/env python
 # @lint-avoid-python-3-compatibility-imports
 #
 # syncsnoop Trace sync() syscall.
@@ -15,7 +15,7 @@
 
 from __future__ import print_function
 from bcc import BPF
-import ctypes as ct
+import sys
 
 # load BPF program
 b = BPF(text="""
@@ -25,27 +25,28 @@ struct data_t {
 
 BPF_PERF_OUTPUT(events);
 
-void kprobe__sys_sync(void *ctx) {
+void syscall__sync(void *ctx) {
     struct data_t data = {};
     data.ts = bpf_ktime_get_ns() / 1000;
     events.perf_submit(ctx, &data, sizeof(data));
 };
 """)
-
-class Data(ct.Structure):
-    _fields_ = [
-        ("ts", ct.c_ulonglong)
-    ]
+b.attach_kprobe(event=b.get_syscall_fnname("sync"),
+                fn_name="syscall__sync")
 
 # header
 print("%-18s %s" % ("TIME(s)", "CALL"))
 
 # process event
 def print_event(cpu, data, size):
-    event = ct.cast(data, ct.POINTER(Data)).contents
+    event = b["events"].event(data)
     print("%-18.9f sync()" % (float(event.ts) / 1000000))
+    sys.stdout.flush()
 
 # loop with callback to print_event
 b["events"].open_perf_buffer(print_event)
 while 1:
-    b.kprobe_poll()
+    try:
+        b.perf_buffer_poll()
+    except KeyboardInterrupt:
+        exit()

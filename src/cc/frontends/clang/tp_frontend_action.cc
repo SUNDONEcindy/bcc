@@ -28,7 +28,9 @@
 #include <clang/Frontend/MultiplexConsumer.h>
 #include <clang/Rewrite/Core/Rewriter.h>
 
+#include "frontend_action_common.h"
 #include "tp_frontend_action.h"
+#include "common.h"
 
 namespace ebpf {
 
@@ -41,78 +43,22 @@ using std::vector;
 using std::regex;
 using std::smatch;
 using std::regex_search;
+using std::istream;
 using std::ifstream;
 using namespace clang;
 
 TracepointTypeVisitor::TracepointTypeVisitor(ASTContext &C, Rewriter &rewriter)
-    : C(C), diag_(C.getDiagnostics()), rewriter_(rewriter), out_(llvm::errs()) {
-}
-
-enum class field_kind_t {
-    common,
-    data_loc,
-    regular,
-    invalid
-};
-
-static inline field_kind_t _get_field_kind(string const& line,
-                                           string& field_type,
-                                           string& field_name) {
-  auto field_pos = line.find("field:");
-  if (field_pos == string::npos)
-    return field_kind_t::invalid;
-
-  auto semi_pos = line.find(';', field_pos);
-  if (semi_pos == string::npos)
-    return field_kind_t::invalid;
-
-  auto size_pos = line.find("size:", semi_pos);
-  if (size_pos == string::npos)
-    return field_kind_t::invalid;
-
-  auto field = line.substr(field_pos + 6/*"field:"*/,
-                           semi_pos - field_pos - 6);
-  auto pos = field.find_last_of("\t ");
-  if (pos == string::npos)
-    return field_kind_t::invalid;
-
-  field_type = field.substr(0, pos);
-  field_name = field.substr(pos + 1);
-  if (field_type.find("__data_loc") != string::npos)
-    return field_kind_t::data_loc;
-  if (field_name.find("common_") == 0)
-    return field_kind_t::common;
-
-  return field_kind_t::regular;
+    : diag_(C.getDiagnostics()), rewriter_(rewriter), out_(llvm::errs()) {
 }
 
 string TracepointTypeVisitor::GenerateTracepointStruct(
     SourceLocation loc, string const& category, string const& event) {
-  string format_file = "/sys/kernel/debug/tracing/events/" +
-    category + "/" + event + "/format";
+  string format_file = tracepoint_format_file(category, event);
   ifstream input(format_file.c_str());
   if (!input)
     return "";
 
-  string tp_struct = "struct tracepoint__" + category + "__" + event + " {\n";
-  tp_struct += "\tu64 __do_not_use__;\n";
-  for (string line; getline(input, line); ) {
-    string field_type, field_name;
-    switch (_get_field_kind(line, field_type, field_name)) {
-    case field_kind_t::invalid:
-    case field_kind_t::common:
-        continue;
-    case field_kind_t::data_loc:
-        tp_struct += "\tint data_loc_" + field_name + ";\n";
-        break;
-    case field_kind_t::regular:
-        tp_struct += "\t" + field_type + " " + field_name + ";\n";
-        break;
-    }
-  }
-
-  tp_struct += "};\n";
-  return tp_struct;
+  return ebpf::parse_tracepoint(input, category, event);
 }
 
 static inline bool _is_tracepoint_struct_type(string const& type_name,
@@ -160,15 +106,15 @@ bool TracepointTypeVisitor::VisitFunctionDecl(FunctionDecl *D) {
       auto type = arg->getType();
       if (type->isPointerType() &&
           type->getPointeeType()->isStructureOrClassType()) {
-        auto type_name = QualType::getAsString(type.split());
+        auto type_name = type->getPointeeType().getAsString();
         string tp_cat, tp_evt;
         if (_is_tracepoint_struct_type(type_name, tp_cat, tp_evt)) {
           string tp_struct = GenerateTracepointStruct(
-              D->getLocStart(), tp_cat, tp_evt);
+              GET_BEGINLOC(D), tp_cat, tp_evt);
           // Get the actual function declaration point (the macro instantiation
           // point if using the TRACEPOINT_PROBE macro instead of the macro
           // declaration point in bpf_helpers.h).
-          auto insert_loc = D->getLocStart();
+          auto insert_loc = GET_BEGINLOC(D);
           insert_loc = rewriter_.getSourceMgr().getFileLoc(insert_loc);
           rewriter_.InsertText(insert_loc, tp_struct);
         }

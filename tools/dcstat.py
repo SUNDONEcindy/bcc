@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/env python
 # @lint-avoid-python-3-compatibility-imports
 #
 # dcstat   Directory entry cache (dcache) stats.
@@ -20,23 +20,23 @@ from bcc import BPF
 from ctypes import c_int
 from time import sleep, strftime
 from sys import argv
+import argparse
 
-def usage():
-    print("USAGE: %s [interval [count]]" % argv[0])
-    exit()
-
-# arguments
-interval = 1
-count = -1
-if len(argv) > 1:
-    try:
-        interval = int(argv[1])
-        if interval == 0:
-            raise
-        if len(argv) > 2:
-            count = int(argv[2])
-    except:  # also catches -h, --help
-        usage()
+examples = """examples:
+    ./dcstat           # display entry cache (dcache) stats
+    ./dcstat -j        # display output in json format
+"""
+parser = argparse.ArgumentParser(
+    description="Directory entry cache (dcache) stats",
+    formatter_class=argparse.RawDescriptionHelpFormatter,
+    epilog=examples)
+parser.add_argument("interval", nargs="?", default=1,
+    help="output interval, in seconds")
+parser.add_argument("count", nargs="?", default=-1,
+    help="number of outputs")
+parser.add_argument("-j", "--json", action="store_true",
+    help="json output")
+args = parser.parse_args()
 
 # define BPF program
 bpf_text = """
@@ -64,7 +64,7 @@ BPF_ARRAY(stats, u64, S_MAXSTAT);
  * __d_lookup_rcu()). It's counted via calls to lookup_fast().
  *
  * The implementation tries different, progressively slower, approaches to
- * lookup a file. At what point do we call it a dcache miss? I've choosen when
+ * lookup a file. At what point do we call it a dcache miss? I've chosen when
  * a d_lookup() (which is called during lookup_slow()) returns zero.
  *
  * I've also included a "SLOW" statistic to show how often the fast lookup
@@ -73,25 +73,22 @@ BPF_ARRAY(stats, u64, S_MAXSTAT);
  */
 void count_fast(struct pt_regs *ctx) {
     int key = S_REFS;
-    u64 *leaf = stats.lookup(&key);
-    if (leaf) (*leaf)++;
+    stats.atomic_increment(key);
 }
 
 void count_lookup(struct pt_regs *ctx) {
     int key = S_SLOW;
-    u64 *leaf = stats.lookup(&key);
-    if (leaf) (*leaf)++;
+    stats.atomic_increment(key);
     if (PT_REGS_RC(ctx) == 0) {
         key = S_MISS;
-        leaf = stats.lookup(&key);
-        if (leaf) (*leaf)++;
+        stats.atomic_increment(key);
     }
 }
 """
 
 # load BPF program
 b = BPF(text=bpf_text)
-b.attach_kprobe(event="lookup_fast", fn_name="count_fast")
+b.attach_kprobe(event_re="^lookup_fast$|^lookup_fast.constprop.*.\d$", fn_name="count_fast")
 b.attach_kretprobe(event="d_lookup", fn_name="count_lookup")
 
 # stat column labels and indexes
@@ -101,31 +98,11 @@ stats = {
     "MISS": 3
 }
 
-# header
-print("%-8s  " % "TIME", end="")
-for stype, idx in sorted(stats.items(), key=lambda k_v: (k_v[1], k_v[0])):
-    print(" %8s" % (stype + "/s"), end="")
-print(" %8s" % "HIT%")
-
-# output
-i = 0
-while (1):
-    if count > 0:
-        i += 1
-        if i > count:
-            exit()
-    try:
-        sleep(interval)
-    except KeyboardInterrupt:
-        pass
-        exit()
-
-    print("%-8s: " % strftime("%H:%M:%S"), end="")
-
+def print_event(b):
     # print each statistic as a column
     for stype, idx in sorted(stats.items(), key=lambda k_v: (k_v[1], k_v[0])):
         try:
-            val = b["stats"][c_int(idx)].value / interval
+            val = b["stats"][c_int(idx)].value / int(args.interval)
             print(" %8d" % val, end="")
         except:
             print(" %8d" % 0, end="")
@@ -139,5 +116,51 @@ while (1):
         print(" %8.2f" % pct)
     except:
         print(" %7s%%" % "-")
+
+def print_event_json(b):
+    json_dict = {}
+    for stype, idx in sorted(stats.items(), key=lambda k_v: (k_v[1], k_v[0])):
+        try:
+            val = b["stats"][c_int(idx)].value / int(args.interval)
+            json_dict[stype] = val
+        except:
+            json_dict[stype] = 0
+    
+    try:
+        ref = b["stats"][c_int(stats["REFS"])].value
+        miss = b["stats"][c_int(stats["MISS"])].value
+        hit = ref - miss
+        pct = float(100) * hit / ref
+        json_dict["HIT%"] = pct
+    except:
+        json_dict["HIT%"] = "-"
+
+    print("%s" % json_dict)
+
+# header
+if not args.json:
+    print("%-8s  " % "TIME", end="")
+    for stype, idx in sorted(stats.items(), key=lambda k_v: (k_v[1], k_v[0])):
+        print(" %8s" % (stype + "/s"), end="")
+    print(" %8s" % "HIT%")
+
+# output
+i = 0
+while (1):
+    if int(args.count) > 0:
+        i += 1
+        if i > int(args.count):
+            exit()
+    try:
+        sleep(int(args.interval))
+    except KeyboardInterrupt:
+        exit()
+
+    if not args.json:
+        print("%-8s: " % strftime("%H:%M:%S"), end="")
+
+        print_event(b)
+    else:
+        print_event_json(b)
 
     b["stats"].clear()

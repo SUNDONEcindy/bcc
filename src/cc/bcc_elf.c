@@ -16,6 +16,7 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <string.h>
@@ -23,32 +24,128 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <limits.h>
+#ifdef HAVE_LIBLZMA
+#include <lzma.h>
+#endif
+#ifdef HAVE_LIBDEBUGINFOD
+#include <elfutils/debuginfod.h>
+#endif
 
 #include <gelf.h>
 #include "bcc_elf.h"
+#include "bcc_proc.h"
 #include "bcc_syms.h"
 
 #define NT_STAPSDT 3
 #define ELF_ST_TYPE(x) (((uint32_t) x) & 0xf)
 
-static int openelf(const char *path, Elf **elf_out, int *fd_out) {
+static int openelf_fd(int fd, Elf **elf_out) {
   if (elf_version(EV_CURRENT) == EV_NONE)
     return -1;
 
-  *fd_out = open(path, O_RDONLY);
-  if (*fd_out < 0)
+  *elf_out = elf_begin(fd, ELF_C_READ, 0);
+  if (*elf_out == NULL)
     return -1;
 
-  *elf_out = elf_begin(*fd_out, ELF_C_READ, 0);
-  if (*elf_out == 0) {
-    close(*fd_out);
+  return 0;
+}
+
+#ifdef HAVE_LIBLZMA
+static int openelf_mem(void *buf, size_t buf_len, Elf **elf_out) {
+  if (elf_version(EV_CURRENT) == EV_NONE)
+    return -1;
+
+  *elf_out = elf_memory(buf, buf_len);
+  if (*elf_out == NULL)
+    return -1;
+
+  return 0;
+}
+#endif
+
+// Provides access to an Elf structure in an uniform way,
+// independently from its source (file or memory buffer).
+struct bcc_elf_file {
+  Elf *elf;
+
+  // Set only when the elf file is parsed from an opened file descriptor that
+  // needs to be closed. Otherwise set to -1.
+  int fd;
+
+  // Set only when the elf file is parsed from a memory buffer that needs to be
+  // freed.
+  void *buf;
+};
+
+// Initializes bcc_elf_file as not pointing to any elf file and not
+// owning any resources. After returning the provided elf_file can be
+// safely passed to bcc_elf_file_close.
+static void bcc_elf_file_init(struct bcc_elf_file *elf_file) {
+  elf_file->elf = NULL;
+  elf_file->fd = -1;
+  elf_file->buf = NULL;
+}
+
+#ifdef HAVE_LIBLZMA
+static int bcc_elf_file_open_buf(void *buf, size_t buf_len,
+                                 struct bcc_elf_file *out) {
+  Elf *elf = NULL;
+
+  if (openelf_mem(buf, buf_len, &elf)) {
+    return -1;
+  }
+
+  out->elf = elf;
+  out->buf = buf;
+  return 0;
+}
+#endif
+
+static int bcc_elf_file_open_fd(int fd, struct bcc_elf_file *out) {
+  Elf *elf = NULL;
+
+  if (openelf_fd(fd, &elf)) {
+    return -1;
+  }
+
+  out->elf = elf;
+  out->fd = fd;
+  return 0;
+}
+
+static int bcc_elf_file_open(const char *path, struct bcc_elf_file *out) {
+  int fd = -1;
+
+  fd = open(path, O_RDONLY);
+  if (fd < 0)
+    return -1;
+
+  if (bcc_elf_file_open_fd(fd, out)) {
+    close(fd);
     return -1;
   }
 
   return 0;
 }
 
+static void bcc_elf_file_close(struct bcc_elf_file *elf_file) {
+  if (elf_file->elf) {
+    elf_end(elf_file->elf);
+  }
+
+  if (elf_file->fd >= 0) {
+    close(elf_file->fd);
+  }
+
+  if (elf_file->buf) {
+    free(elf_file->buf);
+  }
+
+  bcc_elf_file_init(elf_file);
+}
+
 static const char *parse_stapsdt_note(struct bcc_elf_usdt *probe,
+                                      GElf_Shdr *probes_shdr,
                                       const char *desc, int elf_class) {
   if (elf_class == ELFCLASS32) {
     probe->pc = *((uint32_t *)(desc));
@@ -62,6 +159,13 @@ static const char *parse_stapsdt_note(struct bcc_elf_usdt *probe,
     desc = desc + 24;
   }
 
+  // Offset from start of file
+  if (probe->semaphore && probes_shdr)
+    probe->semaphore_offset =
+      probe->semaphore - probes_shdr->sh_addr + probes_shdr->sh_offset;
+  else
+    probe->semaphore_offset = 0;
+
   probe->provider = desc;
   desc += strlen(desc) + 1;
 
@@ -74,9 +178,9 @@ static const char *parse_stapsdt_note(struct bcc_elf_usdt *probe,
   return desc;
 }
 
-static int do_note_segment(Elf_Scn *section, int elf_class,
+static int do_note_segment(Elf_Scn *section, GElf_Shdr *probes_shdr, int elf_class,
                            bcc_elf_probecb callback, const char *binpath,
-                           void *payload) {
+                           uint64_t first_inst_offset, void *payload) {
   Elf_Data *data = NULL;
 
   while ((data = elf_getdata(section, data)) != 0) {
@@ -101,8 +205,14 @@ static int do_note_segment(Elf_Scn *section, int elf_class,
       desc = (const char *)data->d_buf + desc_off;
       desc_end = desc + hdr.n_descsz;
 
-      if (parse_stapsdt_note(&probe, desc, elf_class) == desc_end)
-        callback(binpath, &probe, payload);
+      if (parse_stapsdt_note(&probe, probes_shdr, desc, elf_class) == desc_end) {
+        if (probe.pc < first_inst_offset)
+          fprintf(stderr,
+                  "WARNING: invalid address 0x%lx for probe (%s,%s) in binary %s\n",
+                  probe.pc, probe.provider, probe.name, binpath);
+        else
+          callback(binpath, &probe, payload);
+      }
     }
   }
   return 0;
@@ -111,11 +221,41 @@ static int do_note_segment(Elf_Scn *section, int elf_class,
 static int listprobes(Elf *e, bcc_elf_probecb callback, const char *binpath,
                       void *payload) {
   Elf_Scn *section = NULL;
+  bool found_probes_shdr;
   size_t stridx;
   int elf_class = gelf_getclass(e);
+  uint64_t first_inst_offset = 0;
+  GElf_Shdr probes_shdr = {};
 
   if (elf_getshdrstrndx(e, &stridx) != 0)
     return -1;
+
+  // Get the offset to the first instruction
+  while ((section = elf_nextscn(e, section)) != 0) {
+    GElf_Shdr header;
+
+    if (!gelf_getshdr(section, &header))
+      continue;
+
+    // The elf file section layout is based on increasing virtual address,
+    // getting the first section with SHF_EXECINSTR is enough.
+    if (header.sh_flags & SHF_EXECINSTR) {
+      first_inst_offset = header.sh_addr;
+      break;
+    }
+  }
+
+  found_probes_shdr = false;
+  while ((section = elf_nextscn(e, section)) != 0) {
+    if (!gelf_getshdr(section, &probes_shdr))
+      continue;
+
+    char *name = elf_strptr(e, stridx, probes_shdr.sh_name);
+    if (name && !strcmp(name, ".probes")) {
+      found_probes_shdr = true;
+      break;
+    }
+  }
 
   while ((section = elf_nextscn(e, section)) != 0) {
     GElf_Shdr header;
@@ -129,7 +269,9 @@ static int listprobes(Elf *e, bcc_elf_probecb callback, const char *binpath,
 
     name = elf_strptr(e, stridx, header.sh_name);
     if (name && !strcmp(name, ".note.stapsdt")) {
-      if (do_note_segment(section, elf_class, callback, binpath, payload) < 0)
+      GElf_Shdr *shdr_ptr = found_probes_shdr ? &probes_shdr : NULL;
+      if (do_note_segment(section, shdr_ptr, elf_class, callback, binpath,
+                          first_inst_offset, payload) < 0)
         return -1;
     }
   }
@@ -139,23 +281,63 @@ static int listprobes(Elf *e, bcc_elf_probecb callback, const char *binpath,
 
 int bcc_elf_foreach_usdt(const char *path, bcc_elf_probecb callback,
                          void *payload) {
-  Elf *e;
-  int fd, res;
+  int res;
+  struct bcc_elf_file elf_file;
+  bcc_elf_file_init(&elf_file);
 
-  if (openelf(path, &e, &fd) < 0)
+  if (bcc_elf_file_open(path, &elf_file) < 0)
     return -1;
 
-  res = listprobes(e, callback, path, payload);
-  elf_end(e);
-  close(fd);
+  res = listprobes(elf_file.elf, callback, path, payload);
 
+  bcc_elf_file_close(&elf_file);
   return res;
+}
+
+static Elf_Scn * get_section(Elf *e, const char *section_name,
+                             GElf_Shdr *section_hdr, size_t *section_idx) {
+  Elf_Scn *section = NULL;
+  GElf_Shdr header;
+  char *name;
+
+  size_t stridx;
+  if (elf_getshdrstrndx(e, &stridx) != 0)
+    return NULL;
+
+  size_t index;
+  for (index = 1; (section = elf_nextscn(e, section)) != 0; index++) {
+    if (!gelf_getshdr(section, &header))
+      continue;
+
+    name = elf_strptr(e, stridx, header.sh_name);
+    if (name && !strcmp(name, section_name)) {
+      if (section_hdr)
+        *section_hdr = header;
+      if (section_idx)
+        *section_idx = index;
+      return section;
+    }
+  }
+
+  return NULL;
 }
 
 static int list_in_scn(Elf *e, Elf_Scn *section, size_t stridx, size_t symsize,
                        struct bcc_symbol_option *option,
-                       bcc_elf_symcb callback, void *payload) {
+                       bcc_elf_symcb callback, bcc_elf_symcb_lazy callback_lazy,
+                       void *payload, bool debugfile) {
   Elf_Data *data = NULL;
+
+#if defined(__powerpc64__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+  size_t opdidx = 0;
+  Elf_Scn *opdsec = NULL;
+  GElf_Shdr opdshdr = {};
+  Elf_Data *opddata = NULL;
+
+  opdsec = get_section(e, ".opd", &opdshdr, &opdidx);
+  if (opdsec && opdshdr.sh_type == SHT_PROGBITS)
+    opddata = elf_getdata(opdsec, NULL);
+#endif
 
   while ((data = elf_getdata(section, data)) != 0) {
     size_t i, symcount = data->d_size / symsize;
@@ -166,6 +348,7 @@ static int list_in_scn(Elf *e, Elf_Scn *section, size_t stridx, size_t symsize,
     for (i = 0; i < symcount; ++i) {
       GElf_Sym sym;
       const char *name;
+      size_t name_len;
 
       if (!gelf_getsym(data, (int)i, &sym))
         continue;
@@ -174,15 +357,56 @@ static int list_in_scn(Elf *e, Elf_Scn *section, size_t stridx, size_t symsize,
         continue;
       if (name[0] == 0)
         continue;
+      name_len = strlen(name);
 
       if (sym.st_value == 0)
         continue;
 
-      uint32_t flag = 1 << ELF_ST_TYPE(sym.st_info);
-      if (!(option->use_symbol_type & flag))
+      uint32_t st_type = ELF_ST_TYPE(sym.st_info);
+      if (!(option->use_symbol_type & (1 << st_type)))
         continue;
 
-      if (callback(name, sym.st_value, sym.st_size, payload) < 0)
+#ifdef __powerpc64__
+#if defined(_CALL_ELF) && _CALL_ELF == 2
+      if (option->use_symbol_type & (1 << STT_PPC64_ELFV2_SYM_LEP)) {
+        /*
+         * The PowerPC 64-bit ELF v2 ABI says that the 3 most significant bits
+         * in the st_other field of the symbol table specifies the number of
+         * instructions between a function's Global Entry Point (GEP) and Local
+         * Entry Point (LEP).
+         */
+        switch (sym.st_other >> 5) {
+          /* GEP and LEP are the same for 0 or 1, usage is reserved for 7 */
+          /* If 2, LEP is 1 instruction past the GEP */
+          case 2: sym.st_value += 4; break;
+          /* If 3, LEP is 2 instructions past the GEP */
+          case 3: sym.st_value += 8; break;
+          /* If 4, LEP is 4 instructions past the GEP */
+          case 4: sym.st_value += 16; break;
+          /* If 5, LEP is 8 instructions past the GEP */
+          case 5: sym.st_value += 32; break;
+          /* If 6, LEP is 16 instructions past the GEP */
+          case 6: sym.st_value += 64; break;
+        }
+      }
+#else
+      if (opddata && sym.st_shndx == opdidx) {
+        size_t offset = sym.st_value - opdshdr.sh_addr;
+        /* Find the function descriptor */
+        uint64_t *descr = opddata->d_buf + offset;
+        /* Read the actual entry point address from the descriptor */
+        sym.st_value = *descr;
+      }
+#endif
+#endif
+
+      int ret;
+      if (option->lazy_symbolize)
+        ret = callback_lazy(stridx, sym.st_name, name_len, sym.st_value,
+                            sym.st_size, debugfile, payload);
+      else
+        ret = callback(name, sym.st_value, sym.st_size, payload);
+      if (ret < 0)
         return 1;      // signal termination to caller
     }
   }
@@ -190,8 +414,9 @@ static int list_in_scn(Elf *e, Elf_Scn *section, size_t stridx, size_t symsize,
   return 0;
 }
 
-static int listsymbols(Elf *e, bcc_elf_symcb callback, void *payload,
-                       struct bcc_symbol_option *option) {
+static int listsymbols(Elf *e, bcc_elf_symcb callback,
+                       bcc_elf_symcb_lazy callback_lazy, void *payload,
+                       struct bcc_symbol_option *option, bool debugfile) {
   Elf_Scn *section = NULL;
 
   while ((section = elf_nextscn(e, section)) != 0) {
@@ -204,7 +429,7 @@ static int listsymbols(Elf *e, bcc_elf_symcb callback, void *payload,
       continue;
 
     int rc = list_in_scn(e, section, header.sh_link, header.sh_entsize,
-                         option, callback, payload);
+                         option, callback, callback_lazy, payload, debugfile);
     if (rc == 1)
       break;    // callback signaled termination
 
@@ -216,24 +441,9 @@ static int listsymbols(Elf *e, bcc_elf_symcb callback, void *payload,
 }
 
 static Elf_Data * get_section_elf_data(Elf *e, const char *section_name) {
-  Elf_Scn *section = NULL;
-  GElf_Shdr header;
-  char *name;
-
-  size_t stridx;
-  if (elf_getshdrstrndx(e, &stridx) != 0)
-    return NULL;
-
-  while ((section = elf_nextscn(e, section)) != 0) {
-    if (!gelf_getshdr(section, &header))
-      continue;
-
-    name = elf_strptr(e, stridx, header.sh_name);
-    if (name && !strcmp(name, section_name)) {
-      return elf_getdata(section, NULL);
-    }
-  }
-
+  Elf_Scn *section = get_section(e, section_name, NULL, NULL);
+  if (section)
+    return elf_getdata(section, NULL);
   return NULL;
 }
 
@@ -345,8 +555,10 @@ static int verify_checksum(const char *file, unsigned int crc) {
   if (fd < 0)
     return 0;
 
-  if (fstat(fd, &st) < 0)
+  if (fstat(fd, &st) < 0) {
+    close(fd);
     return 0;
+  }
 
   buf = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
   if (!buf) {
@@ -361,161 +573,391 @@ static int verify_checksum(const char *file, unsigned int crc) {
   return actual == crc;
 }
 
-static char *find_debug_via_debuglink(Elf *e, const char *binpath,
-                                      int check_crc) {
+// Check if two filenames point to the same file, including hard or soft links.
+static bool same_file(char *a, const char *b)
+{
+	struct stat stat_a, stat_b;
+
+	if (stat(a, &stat_a) || stat(b, &stat_b))
+		return false;
+
+	if ((stat_a.st_dev == stat_b.st_dev) &&
+	    (stat_a.st_ino == stat_b.st_ino))
+		return true;
+	else
+		return false;
+}
+
+static int try_open_debuglink_candidate(const char *path, int check_crc,
+                                        int crc, struct bcc_elf_file *out) {
+  if (access(path, F_OK)) {
+    return -1;
+  }
+
+  if (check_crc && !verify_checksum(path, crc)) {
+    return -1;
+  }
+
+  return bcc_elf_file_open(path, out);
+}
+
+// Returns 0 on success, otherwise nonzero.
+// If successfull, 'out' param is a valid bcc_elf_file.
+// Caller is responsible for calling bcc_elf_file_close when done using it.
+// See https://sourceware.org/gdb/onlinedocs/gdb/Separate-Debug-Files.html
+static int find_debug_via_debuglink(Elf *e, const char *binpath, int check_crc,
+                                    struct bcc_elf_file *out) {
   char fullpath[PATH_MAX];
+  char tmppath[PATH_MAX];
   char *bindir = NULL;
-  char *res = NULL;
   unsigned int crc;
   char *name;  // the name of the debuginfo file
 
   if (!find_debuglink(e, &name, &crc))
-    return NULL;
+    return -1;
 
-  bindir = strdup(binpath);
-  bindir = dirname(bindir);
+  strncpy(tmppath, binpath, PATH_MAX);
+  tmppath[PATH_MAX - 1] = 0;
+  bindir = dirname(tmppath);
 
   // Search for the file in 'binpath', but ignore the file we find if it
   // matches the binary itself: the binary will always be probed later on,
   // and it might contain poorer symbols (e.g. stripped or partial symbols)
   // than the external debuginfo that might be available elsewhere.
   snprintf(fullpath, sizeof(fullpath),"%s/%s", bindir, name);
-  if (strcmp(fullpath, binpath) != 0 && access(fullpath, F_OK) != -1) {
-    res = strdup(fullpath);
-    goto DONE;
-  }
+  if (same_file(fullpath, binpath) != true &&
+      try_open_debuglink_candidate(fullpath, check_crc, crc, out) == 0)
+    return 0;
 
   // Search for the file in 'binpath'/.debug
   snprintf(fullpath, sizeof(fullpath), "%s/.debug/%s", bindir, name);
-  if (access(fullpath, F_OK) != -1) {
-    res = strdup(fullpath);
-    goto DONE;
-  }
+  if (try_open_debuglink_candidate(fullpath, check_crc, crc, out) == 0)
+    return 0;
 
   // Search for the file in the global debug directory /usr/lib/debug/'binpath'
   snprintf(fullpath, sizeof(fullpath), "/usr/lib/debug%s/%s", bindir, name);
-  if (access(fullpath, F_OK) != -1) {
-    res = strdup(fullpath);
-    goto DONE;
-  }
+  if (try_open_debuglink_candidate(fullpath, check_crc, crc, out) == 0)
+    return 0;
 
-DONE:
-  free(bindir);
-  if (check_crc && !verify_checksum(res, crc))
-    return NULL;
-  return res;
+  return -1;
 }
 
-static char *find_debug_via_buildid(Elf *e) {
+// Returns 0 on success, otherwise nonzero.
+// If successfull, 'out' param is a valid bcc_elf_file.
+// Caller is responsible for calling bcc_elf_file_close when done using it.
+// See https://sourceware.org/gdb/onlinedocs/gdb/Separate-Debug-Files.html
+static int find_debug_via_buildid(Elf *e, struct bcc_elf_file *out) {
   char fullpath[PATH_MAX];
   char buildid[128];  // currently 40 seems to be default, let's be safe
 
   if (!find_buildid(e, buildid))
-    return NULL;
+    return -1;
 
   // Search for the file in the global debug directory with a sub-path:
   //    mm/nnnnnn...nnnn.debug
   // Where mm are the first two characters of the buildid, and nnnn are the
   // rest of the build id, followed by .debug.
-  snprintf(fullpath, sizeof(fullpath), "/usr/lib/debug/.build-id/%c%c/%s.debug",
-          buildid[0], buildid[1], buildid + 2);
-  if (access(fullpath, F_OK) != -1) {
-    return strdup(fullpath);
+  const char *bcc_debuginfo_root = getenv("BCC_DEBUGINFO_ROOT");
+  if (bcc_debuginfo_root == NULL)
+    bcc_debuginfo_root = "/usr/lib/debug";
+  snprintf(fullpath, sizeof(fullpath), "%s/.build-id/%c%c/%s.debug",
+           bcc_debuginfo_root, buildid[0], buildid[1], buildid + 2);
+  return bcc_elf_file_open(fullpath, out);
+}
+
+// Returns 0 on success, otherwise nonzero.
+// If successfull, 'out' param is a valid bcc_elf_file.
+// Caller is responsible for calling bcc_elf_file_close when done using it.
+// See
+// https://github.com/torvalds/linux/blob/v5.2/tools/perf/Documentation/perf-report.txt#L325
+static int find_debug_via_symfs(Elf *e, const char *path,
+                                struct bcc_elf_file *out) {
+  char fullpath[PATH_MAX];
+  char buildid[128];
+  char symfs_buildid[128];
+  int check_build_id;
+  char *symfs;
+  struct bcc_elf_file symfs_elf_file;
+  bcc_elf_file_init(&symfs_elf_file);
+
+  symfs = getenv("BCC_SYMFS");
+  if (!symfs || !*symfs)
+    goto fail;
+
+  check_build_id = find_buildid(e, buildid);
+
+  int ns_prefix_length = 0;
+  sscanf(path, "/proc/%*u/root/%n", &ns_prefix_length);
+  path += ns_prefix_length;
+
+  snprintf(fullpath, sizeof(fullpath), "%s/%s", symfs, path);
+  if (access(fullpath, F_OK) == -1)
+    goto fail;
+
+  if (bcc_elf_file_open(fullpath, &symfs_elf_file) < 0) {
+    goto fail;
   }
 
-  return NULL;
+  if (check_build_id) {
+    if (!find_buildid(symfs_elf_file.elf, symfs_buildid))
+      goto fail;
+
+    if (strncmp(buildid, symfs_buildid, sizeof(buildid)))
+      goto fail;
+  }
+
+  *out = symfs_elf_file;
+  return 0;
+
+fail:
+  bcc_elf_file_close(&symfs_elf_file);
+  return -1;
+}
+
+#ifdef HAVE_LIBLZMA
+
+#define LZMA_MIN_BUFFER_SIZE 4096
+#define LZMA_MEMLIMIT (128 * 1024 * 1024)
+static int open_mini_debug_info_file(void *gnu_debugdata,
+                                     size_t gnu_debugdata_size,
+                                     struct bcc_elf_file *out) {
+  void *decompressed = NULL;
+  void *new_decompressed = NULL;
+  size_t decompressed_data_size = 0;
+  size_t decompressed_buffer_size = 0;
+  lzma_stream stream = LZMA_STREAM_INIT;
+  lzma_ret ret;
+
+  ret = lzma_stream_decoder(&stream, LZMA_MEMLIMIT, 0);
+  if (ret != LZMA_OK)
+    return -1;
+
+  stream.next_in = gnu_debugdata;
+  stream.avail_in = gnu_debugdata_size;
+  stream.avail_out = 0;
+
+  while (ret == LZMA_OK && stream.avail_in > 0) {
+    if (stream.avail_out < LZMA_MIN_BUFFER_SIZE) {
+      decompressed_buffer_size += LZMA_MIN_BUFFER_SIZE;
+      new_decompressed = realloc(decompressed, decompressed_buffer_size);
+      if (new_decompressed == NULL) {
+        ret = LZMA_MEM_ERROR;
+        break;
+      }
+
+      decompressed = new_decompressed;
+      stream.avail_out += LZMA_MIN_BUFFER_SIZE;
+      stream.next_out = decompressed + decompressed_data_size;
+    }
+    ret = lzma_code(&stream, LZMA_FINISH);
+    decompressed_data_size = decompressed_buffer_size - stream.avail_out;
+  }
+  lzma_end(&stream);
+
+  if (ret != LZMA_STREAM_END ||
+      bcc_elf_file_open_buf(decompressed, decompressed_data_size, out)) {
+    free(decompressed);
+    return -1;
+  }
+
+  return 0;
+}
+
+// Returns 0 on success, otherwise nonzero.
+// If successfull, 'out' param is a valid bcc_elf_file.
+// Caller is responsible for calling bcc_elf_file_close when done using it.
+// See https://sourceware.org/gdb/onlinedocs/gdb/MiniDebugInfo.html
+static int find_debug_via_mini_debug_info(Elf *elf, struct bcc_elf_file *out) {
+  Elf_Data *gnu_debugdata;
+
+  gnu_debugdata = get_section_elf_data(elf, ".gnu_debugdata");
+  if (gnu_debugdata == NULL)
+    return -1;
+
+  return open_mini_debug_info_file(gnu_debugdata->d_buf, gnu_debugdata->d_size,
+                                   out);
+}
+#endif
+
+#ifdef HAVE_LIBDEBUGINFOD
+
+// Returns 0 on success, otherwise nonzero.
+// If successfull, 'out' param is a valid bcc_elf_file.
+// Caller is responsible for calling bcc_elf_file_close when done using it.
+// See https://sourceware.org/elfutils/Debuginfod.html
+static int find_debug_via_debuginfod(Elf *e, struct bcc_elf_file *out) {
+  char buildid[128];
+  int fd = -1;
+
+  if (!find_buildid(e, buildid))
+    return -1;
+
+  debuginfod_client *client = debuginfod_begin();
+  if (!client)
+    return -1;
+
+  // In case of an error, the function returns a negative error code.
+  fd = debuginfod_find_debuginfo(client, (const unsigned char *)buildid, 0,
+                                 NULL);
+  if (fd >= 0) {
+    if (bcc_elf_file_open_fd(fd, out)) {
+      close(fd);
+      fd = -1;
+    }
+  }
+
+  debuginfod_end(client);
+  return fd >= 0 ? 0 : -1;
+}
+#endif
+
+// Returns 0 on success, otherwise nonzero.
+// If successfull, 'out' param is a valid bcc_elf_file.
+// Caller is responsible for calling bcc_elf_file_close when done using it.
+static int find_debug_file(Elf *e, const char *path, int check_crc,
+                           struct bcc_elf_file *out) {
+  if (find_debug_via_symfs(e, path, out) == 0)
+    return 0;
+
+  if (find_debug_via_buildid(e, out) == 0)
+    return 0;
+
+  if (find_debug_via_debuglink(e, path, check_crc, out) == 0)
+    return 0;
+
+#ifdef HAVE_LIBLZMA
+  if (find_debug_via_mini_debug_info(e, out) == 0)
+    return 0;
+#endif
+
+#ifdef HAVE_LIBDEBUGINFOD
+  if (find_debug_via_debuginfod(e, out) == 0)
+    return 0;
+#endif
+
+  return -1;
 }
 
 static int foreach_sym_core(const char *path, bcc_elf_symcb callback,
-                            struct bcc_symbol_option *option, void *payload,
-                            int is_debug_file) {
-  Elf *e;
-  int fd, res;
-  char *debug_file;
+                            bcc_elf_symcb_lazy callback_lazy,
+                            struct bcc_symbol_option *option, void *payload) {
+  struct bcc_elf_file elf_file;
+  bcc_elf_file_init(&elf_file);
+  struct bcc_elf_file debug_elf_file;
+  bcc_elf_file_init(&debug_elf_file);
+  int res;
 
   if (!option)
     return -1;
 
-  if (openelf(path, &e, &fd) < 0)
+  if (bcc_elf_file_open(path, &elf_file) < 0)
     return -1;
 
-  // If there is a separate debuginfo file, try to locate and read it, first
-  // using the build-id section, then using the debuglink section. These are
-  // also the rules that GDB folows.
-  // See: https://sourceware.org/gdb/onlinedocs/gdb/Separate-Debug-Files.html
-  if (option->use_debug_file && !is_debug_file) {
-    // The is_debug_file argument helps avoid infinitely resolving debuginfo
-    // files for debuginfo files and so on.
-    debug_file = find_debug_via_buildid(e);
-    if (!debug_file)
-      debug_file = find_debug_via_debuglink(e, path,
-                                            option->check_debug_file_crc);
-    if (debug_file) {
-      foreach_sym_core(debug_file, callback, option, payload, 1);
-      free(debug_file);
+  if (option->use_debug_file) {
+    if (find_debug_file(elf_file.elf, path, option->check_debug_file_crc,
+                        &debug_elf_file) == 0) {
+      listsymbols(debug_elf_file.elf, callback, callback_lazy, payload, option,
+                  1);
+      bcc_elf_file_close(&debug_elf_file);
     }
   }
 
-  res = listsymbols(e, callback, payload, option);
-  elf_end(e);
-  close(fd);
+  res = listsymbols(elf_file.elf, callback, callback_lazy, payload, option, 0);
+  bcc_elf_file_close(&elf_file);
   return res;
 }
 
 int bcc_elf_foreach_sym(const char *path, bcc_elf_symcb callback,
                         void *option, void *payload) {
-  return foreach_sym_core(
-      path, callback, (struct bcc_symbol_option*)option, payload, 0);
+  struct bcc_symbol_option *o = option;
+  o->lazy_symbolize = 0;
+  return foreach_sym_core(path, callback, NULL, o, payload);
 }
 
-static int loadaddr(Elf *e, uint64_t *addr) {
-  size_t phnum, i;
+int bcc_elf_foreach_sym_lazy(const char *path, bcc_elf_symcb_lazy callback,
+                        void *option, void *payload) {
+  struct bcc_symbol_option *o = option;
+  o->lazy_symbolize = 1;
+  return foreach_sym_core(path, NULL, callback, o, payload);
+}
 
-  if (elf_getphdrnum(e, &phnum) != 0)
-    return -1;
+int bcc_elf_get_text_scn_info(const char *path, uint64_t *addr,
+                              uint64_t *offset) {
+  int err;
+  Elf_Scn *section = NULL;
+  GElf_Shdr header;
+  size_t stridx;
+  char *name;
+  struct bcc_elf_file elf_file;
+  bcc_elf_file_init(&elf_file);
 
-  for (i = 0; i < phnum; ++i) {
-    GElf_Phdr header;
+  if ((err = bcc_elf_file_open(path, &elf_file)) < 0 ||
+      (err = elf_getshdrstrndx(elf_file.elf, &stridx)) < 0)
+    goto exit;
 
-    if (!gelf_getphdr(e, (int)i, &header))
+  err = -1;
+  while ((section = elf_nextscn(elf_file.elf, section)) != 0) {
+    if (!gelf_getshdr(section, &header))
       continue;
 
-    if (header.p_type != PT_LOAD)
-      continue;
-
-    *addr = (uint64_t)header.p_vaddr;
-    return 0;
+    name = elf_strptr(elf_file.elf, stridx, header.sh_name);
+    if (name && !strcmp(name, ".text")) {
+      *addr = (uint64_t)header.sh_addr;
+      *offset = (uint64_t)header.sh_offset;
+      err = 0;
+      break;
+    }
   }
 
-  return -1;
+exit:
+  bcc_elf_file_close(&elf_file);
+  return err;
 }
 
-int bcc_elf_loadaddr(const char *path, uint64_t *address) {
-  Elf *e;
-  int fd, res;
+int bcc_elf_foreach_load_section(const char *path,
+                                 bcc_elf_load_sectioncb callback,
+                                 void *payload) {
+  int err = -1, res;
+  size_t nhdrs, i;
+  struct bcc_elf_file elf_file;
+  bcc_elf_file_init(&elf_file);
 
-  if (openelf(path, &e, &fd) < 0)
-    return -1;
+  if (bcc_elf_file_open(path, &elf_file) < 0)
+    goto exit;
 
-  res = loadaddr(e, address);
-  elf_end(e);
-  close(fd);
+  if (elf_getphdrnum(elf_file.elf, &nhdrs) != 0)
+    goto exit;
 
-  return res;
+  GElf_Phdr header;
+  for (i = 0; i < nhdrs; i++) {
+    if (!gelf_getphdr(elf_file.elf, (int)i, &header))
+      continue;
+    if (header.p_type != PT_LOAD || !(header.p_flags & PF_X))
+      continue;
+    res = callback(header.p_vaddr, header.p_memsz, header.p_offset, payload);
+    if (res < 0) {
+      err = 1;
+      goto exit;
+    }
+  }
+  err = 0;
+
+exit:
+  bcc_elf_file_close(&elf_file);
+  return err;
 }
 
 int bcc_elf_get_type(const char *path) {
-  Elf *e;
   GElf_Ehdr hdr;
-  int fd;
   void* res = NULL;
+  struct bcc_elf_file elf_file;
+  bcc_elf_file_init(&elf_file);
 
-  if (openelf(path, &e, &fd) < 0)
+  if (bcc_elf_file_open(path, &elf_file) < 0)
     return -1;
 
-  res = (void*)gelf_getehdr(e, &hdr);
-  elf_end(e);
-  close(fd);
+  res = (void *)gelf_getehdr(elf_file.elf, &hdr);
+  bcc_elf_file_close(&elf_file);
 
   if (!res)
     return -1;
@@ -529,6 +971,288 @@ int bcc_elf_is_exe(const char *path) {
 
 int bcc_elf_is_shared_obj(const char *path) {
   return bcc_elf_get_type(path) == ET_DYN;
+}
+
+int bcc_elf_is_vdso(const char *name) {
+  return strcmp(name, "[vdso]") == 0;
+}
+
+// -2: Failed
+// -1: Not initialized
+// >0: Initialized
+static int vdso_image_fd = -1;
+
+static int find_vdso(struct mod_info *info, int enter_ns, void *payload) {
+  int fd;
+  char tmpfile[128];
+  if (!bcc_elf_is_vdso(info->name))
+    return 0;
+
+  uint64_t sz = info->end_addr - info->start_addr;
+  void *image = malloc(sz);
+  if (!image)
+    goto on_error;
+  memcpy(image, (void *)info->start_addr, sz);
+
+  snprintf(tmpfile, sizeof(tmpfile), "/tmp/bcc_%d_vdso_image_XXXXXX", getpid());
+  fd = mkostemp(tmpfile, O_CLOEXEC);
+  if (fd < 0) {
+    fprintf(stderr, "Unable to create temp file: %s\n", strerror(errno));
+    goto on_error;
+  }
+  // Unlink the file to avoid leaking
+  if (unlink(tmpfile) == -1)
+    fprintf(stderr, "Unlink %s failed: %s\n", tmpfile, strerror(errno));
+
+  if (write(fd, image, sz) == -1) {
+    fprintf(stderr, "Failed to write to vDSO image: %s\n", strerror(errno));
+    close(fd);
+    goto on_error;
+  }
+  vdso_image_fd = fd;
+
+on_error:
+  if (image)
+    free(image);
+  // Always stop the iteration
+  return -1;
+}
+
+int bcc_elf_foreach_vdso_sym(bcc_elf_symcb callback, void *payload) {
+  Elf *elf;
+  static struct bcc_symbol_option default_option = {
+    .use_debug_file = 0,
+    .check_debug_file_crc = 0,
+    .use_symbol_type = (1 << STT_FUNC) | (1 << STT_GNU_IFUNC)
+  };
+
+  if (vdso_image_fd == -1) {
+    vdso_image_fd = -2;
+    bcc_procutils_each_module(getpid(), &find_vdso, NULL);
+  }
+  if (vdso_image_fd == -2)
+    return -1;
+
+  if (openelf_fd(vdso_image_fd, &elf) == -1)
+    return -1;
+
+  int rc = listsymbols(elf, callback, NULL, payload, &default_option, 0);
+  elf_end(elf);
+  return rc;
+}
+
+// return value: 0   : success
+//               < 0 : error and no bcc lib found
+//               > 0 : error and bcc lib found
+static int bcc_free_memory_with_file(const char *path) {
+  unsigned long sym_addr = 0, sym_shndx;
+  Elf_Scn *section = NULL;
+  int err;
+  GElf_Shdr header;
+  struct bcc_elf_file elf_file;
+  bcc_elf_file_init(&elf_file);
+
+  if ((err = bcc_elf_file_open(path, &elf_file)) < 0)
+    goto exit;
+
+  // get symbol address of "bcc_free_memory", which
+  // will be used to calculate runtime .text address
+  // range, esp. for shared libraries.
+  err = -1;
+  while ((section = elf_nextscn(elf_file.elf, section)) != 0) {
+    Elf_Data *data = NULL;
+    size_t symsize;
+
+    if (!gelf_getshdr(section, &header))
+      continue;
+
+    if (header.sh_type != SHT_SYMTAB && header.sh_type != SHT_DYNSYM)
+      continue;
+
+    /* iterate all symbols */
+    symsize = header.sh_entsize;
+    while ((data = elf_getdata(section, data)) != 0) {
+      size_t i, symcount = data->d_size / symsize;
+
+      for (i = 0; i < symcount; ++i) {
+        GElf_Sym sym;
+
+        if (!gelf_getsym(data, (int)i, &sym))
+          continue;
+
+        if (GELF_ST_TYPE(sym.st_info) != STT_FUNC)
+          continue;
+
+        const char *name;
+        if ((name = elf_strptr(elf_file.elf, header.sh_link, sym.st_name)) ==
+            NULL)
+          continue;
+
+        if (strcmp(name, "bcc_free_memory") == 0) {
+          sym_addr = sym.st_value;
+          sym_shndx = sym.st_shndx;
+          break;
+        }
+      }
+    }
+  }
+
+  // Didn't find bcc_free_memory in the ELF file.
+  if (sym_addr == 0)
+    goto exit;
+
+  int sh_idx = 0;
+  section = NULL;
+  err = 1;
+  while ((section = elf_nextscn(elf_file.elf, section)) != 0) {
+    sh_idx++;
+    if (!gelf_getshdr(section, &header))
+      continue;
+
+    if (sh_idx == sym_shndx) {
+      unsigned long saddr, saddr_n, eaddr;
+      long page_size = sysconf(_SC_PAGESIZE);
+
+      saddr = (unsigned long)bcc_free_memory - sym_addr + header.sh_addr;
+      eaddr = saddr + header.sh_size;
+
+      // adjust saddr and eaddr, start addr needs to be page aligned
+      saddr_n = (saddr + page_size - 1) & ~(page_size - 1);
+      eaddr -= saddr_n - saddr;
+
+      if (madvise((void *)saddr_n, eaddr - saddr_n, MADV_DONTNEED)) {
+        fprintf(stderr, "madvise failed, saddr %lx, eaddr %lx\n", saddr, eaddr);
+        goto exit;
+      }
+
+      err = 0;
+      break;
+    }
+  }
+
+exit:
+  bcc_elf_file_close(&elf_file);
+  return err;
+}
+
+// Free bcc mmemory
+//
+// The main purpose of this function is to free llvm/clang text memory
+// through madvise MADV_DONTNEED.
+//
+// bcc could be linked statically or dynamically into the application.
+// If it is static linking, there is no easy way to know which region
+// inside .text section belongs to llvm/clang, so the whole .text section
+// is freed. Otherwise, the process map is searched to find libbcc.so
+// library and the whole .text section for that shared library is
+// freed.
+//
+// Note that the text memory used by bcc (mainly llvm/clang) is reclaimable
+// in the kernel as it is file backed. But the reclaim process
+// may take some time if no memory pressure. So this API is mostly
+// used for application who needs to immediately lowers its RssFile
+// metric right after loading BPF program.
+int bcc_free_memory() {
+  int err;
+
+  // First try whether bcc is statically linked or not
+  err = bcc_free_memory_with_file("/proc/self/exe");
+  if (err >= 0)
+    return -err;
+
+  // Not statically linked, let us find the libbcc.so
+  FILE *maps = fopen("/proc/self/maps", "r");
+  if (!maps)
+    return -1;
+
+  char *line = NULL;
+  size_t size;
+  while (getline(&line, &size, maps) > 0) {
+    char *libbcc = strstr(line, "libbcc.so");
+    if (!libbcc)
+      continue;
+
+    // Parse the line and get the full libbcc.so path
+    unsigned long addr_start, addr_end, offset, inode;
+    int path_start = 0, path_end = 0;
+    unsigned int devmajor, devminor;
+    char perms[8];
+    if (sscanf(line, "%lx-%lx %7s %lx %x:%x %lu %n%*[^\n]%n",
+               &addr_start, &addr_end, perms, &offset,
+               &devmajor, &devminor, &inode,
+               &path_start, &path_end) < 7)
+       break;
+
+    // Free the text in the bcc dynamic library.
+    char libbcc_path[4096];
+    memcpy(libbcc_path, line + path_start, path_end - path_start);
+    libbcc_path[path_end - path_start] = '\0';
+    err = bcc_free_memory_with_file(libbcc_path);
+    err = (err <= 0) ? err : -err;
+  }
+
+  fclose(maps);
+  free(line);
+  return err;
+}
+
+int bcc_elf_get_buildid(const char *path, char *buildid) {
+  int rc = -1;
+  struct bcc_elf_file elf_file;
+  bcc_elf_file_init(&elf_file);
+
+  if (bcc_elf_file_open(path, &elf_file) < 0)
+    return -1;
+
+  if (!find_buildid(elf_file.elf, buildid))
+    goto exit;
+
+  rc = 0;
+exit:
+  bcc_elf_file_close(&elf_file);
+  return rc;
+}
+
+int bcc_elf_symbol_str(const char *path, size_t section_idx,
+                       size_t str_table_idx, char *out, size_t len,
+                       int debugfile) {
+  int err = 0;
+  const char *name;
+  struct bcc_elf_file elf_file;
+  bcc_elf_file_init(&elf_file);
+  struct bcc_elf_file debug_elf_file;
+  bcc_elf_file_init(&debug_elf_file);
+
+  if (!out)
+    return -1;
+
+  if (bcc_elf_file_open(path, &elf_file) < 0)
+    return -1;
+
+  if (debugfile) {
+    if (find_debug_file(elf_file.elf, path, 0, &debug_elf_file)) {
+      err = -1;
+      goto exit;
+    }
+
+    if ((name = elf_strptr(debug_elf_file.elf, section_idx, str_table_idx)) ==
+        NULL) {
+      err = -1;
+      goto exit;
+    }
+  } else {
+    if ((name = elf_strptr(elf_file.elf, section_idx, str_table_idx)) == NULL) {
+      err = -1;
+      goto exit;
+    }
+  }
+
+  strncpy(out, name, len);
+
+exit:
+  bcc_elf_file_close(&debug_elf_file);
+  bcc_elf_file_close(&elf_file);
+  return err;
 }
 
 #if 0

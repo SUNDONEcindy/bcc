@@ -11,6 +11,7 @@
 # Licensed under the Apache License, Version 2.0 (the "License")
 #
 # 13-Jul-2016   Emmanuel Bretelle first version
+# 17-Mar-2022   Rocky Xing        Added PID filter support.
 
 from __future__ import absolute_import
 from __future__ import division
@@ -28,6 +29,7 @@ import pwd
 import re
 import signal
 from time import sleep
+import json
 
 FIELDS = (
     "PID",
@@ -40,7 +42,7 @@ FIELDS = (
     "WRITE_HIT%"
 )
 DEFAULT_FIELD = "HITS"
-
+DEFAULT_SORT_FIELD = FIELDS.index(DEFAULT_FIELD)
 
 # signal handler
 def signal_ignore(signal, frame):
@@ -61,7 +63,7 @@ def get_meminfo():
 
 def get_processes_stats(
         bpf,
-        sort_field=FIELDS.index(DEFAULT_FIELD),
+        sort_field=DEFAULT_SORT_FIELD,
         sort_reverse=False):
     '''
     Return a tuple containing:
@@ -72,7 +74,7 @@ def get_processes_stats(
     counts = bpf.get_table("counts")
     stats = defaultdict(lambda: defaultdict(int))
     for k, v in counts.items():
-        stats["%d-%d-%s" % (k.pid, k.uid, k.comm.decode())][k.ip] = v.value
+        stats["%d-%d-%s" % (k.pid, k.uid, k.comm.decode('utf-8', 'replace'))][k.ip] = v.value
     stats_list = []
 
     for pid, count in sorted(stats.items(), key=lambda stat: stat[0]):
@@ -88,16 +90,16 @@ def get_processes_stats(
         whits = 0
 
         for k, v in count.items():
-            if re.match('mark_page_accessed', bpf.ksym(k)) is not None:
+            if re.match(b'mark_page_accessed', bpf.ksym(k)) is not None:
                 mpa = max(0, v)
 
-            if re.match('mark_buffer_dirty', bpf.ksym(k)) is not None:
+            if re.match(b'mark_buffer_dirty', bpf.ksym(k)) is not None:
                 mbd = max(0, v)
 
-            if re.match('add_to_page_cache_lru', bpf.ksym(k)) is not None:
+            if re.match(b'add_to_page_cache_lru', bpf.ksym(k)) is not None:
                 apcl = max(0, v)
 
-            if re.match('account_page_dirtied', bpf.ksym(k)) is not None:
+            if re.match(b'account_page_dirtied', bpf.ksym(k)) is not None:
                 apd = max(0, v)
 
             # access = total cache access incl. reads(mpa) and writes(mbd)
@@ -107,7 +109,7 @@ def get_processes_stats(
             misses = (apcl + apd)
 
             # rtaccess is the read hit % during the sample period.
-            # wtaccess is the write hit % during the smaple period.
+            # wtaccess is the write hit % during the sample period.
             if mpa > 0:
                 rtaccess = float(mpa) / (access + misses)
             if apcl > 0:
@@ -132,11 +134,12 @@ def get_processes_stats(
 
 
 def handle_loop(stdscr, args):
-    # don't wait on key press
-    stdscr.nodelay(1)
+    if stdscr:
+        # don't wait on key press
+        stdscr.nodelay(1)
     # set default sorting field
     sort_field = FIELDS.index(DEFAULT_FIELD)
-    sort_reverse = False
+    sort_reverse = True
 
     # load BPF program
     bpf_text = """
@@ -152,31 +155,48 @@ def handle_loop(stdscr, args):
     BPF_HASH(counts, struct key_t);
 
     int do_count(struct pt_regs *ctx) {
+        u32 pid = bpf_get_current_pid_tgid() >> 32;
+        if (FILTER_PID)
+            return 0;
+
         struct key_t key = {};
-        u64 zero = 0 , *val;
-        u64 pid = bpf_get_current_pid_tgid();
         u32 uid = bpf_get_current_uid_gid();
 
         key.ip = PT_REGS_IP(ctx);
-        key.pid = pid & 0xFFFFFFFF;
-        key.uid = uid & 0xFFFFFFFF;
+        key.pid = pid;
+        key.uid = uid;
         bpf_get_current_comm(&(key.comm), 16);
 
-        val = counts.lookup_or_init(&key, &zero);  // update counter
-        (*val)++;
+        counts.increment(key);
         return 0;
     }
 
     """
+
+    if args.pid:
+        bpf_text = bpf_text.replace('FILTER_PID', 'pid != %d' % args.pid)
+    else:
+        bpf_text = bpf_text.replace('FILTER_PID', '0')
+
     b = BPF(text=bpf_text)
     b.attach_kprobe(event="add_to_page_cache_lru", fn_name="do_count")
     b.attach_kprobe(event="mark_page_accessed", fn_name="do_count")
-    b.attach_kprobe(event="account_page_dirtied", fn_name="do_count")
     b.attach_kprobe(event="mark_buffer_dirty", fn_name="do_count")
 
-    exiting = 0
+    # Function account_page_dirtied() is changed to folio_account_dirtied() in 5.15.
+    if BPF.get_kprobe_functions(b'folio_account_dirtied'):
+        b.attach_kprobe(event="folio_account_dirtied", fn_name="do_count")
+    elif BPF.get_kprobe_functions(b'account_page_dirtied'):
+        b.attach_kprobe(event="account_page_dirtied", fn_name="do_count")
 
-    while 1:
+    exiting = 0
+    countdown = int(args.count)
+
+    def print_event_stdscr():
+        nonlocal sort_reverse
+        nonlocal sort_field
+        nonlocal exiting
+        nonlocal b
         s = stdscr.getch()
         if s == ord('q'):
             exiting = 1
@@ -222,33 +242,100 @@ def handle_loop(stdscr, args):
         )
         (height, width) = stdscr.getmaxyx()
         for i, stat in enumerate(process_stats):
+            uid = int(stat[1])
+            try:
+                username = pwd.getpwuid(uid)[0]
+            except KeyError:
+                # `pwd` throws a KeyError if the user cannot be found. This can
+                # happen e.g. when the process is running in a cgroup that has
+                # different users from the host.
+                username = 'UNKNOWN({})'.format(uid)
+
             stdscr.addstr(
                 i + 2, 0,
                 "{0:8} {username:8.8} {2:16} {3:8} {4:8} "
                 "{5:8} {6:9.1f}% {7:9.1f}%".format(
-                    *stat, username=pwd.getpwuid(int(stat[1]))[0]
+                    *stat, username=username
                 )
             )
             if i > height - 4:
                 break
         stdscr.refresh()
-        if exiting:
-            print("Detaching...")
+    
+    def print_event_json():
+        nonlocal sort_reverse
+        nonlocal sort_field
+        nonlocal exiting
+        nonlocal b
+
+        process_stats = get_processes_stats(
+            b,
+            sort_field=sort_field,
+            sort_reverse=sort_reverse)
+        
+        try:
+            sleep(args.interval)
+        except KeyboardInterrupt:
+            exiting = 1
+        for i, stat in enumerate(process_stats):
+            uid = int(stat[1])
+            try:
+                username = pwd.getpwuid(uid)[0]
+            except KeyError:
+                # `pwd` throws a KeyError if the user cannot be found. This can
+                # happen e.g. when the process is running in a cgroup that has
+                # different users from the host.
+                username = 'UNKNOWN({})'.format(uid)
+            # (int(_pid), uid, comm,
+            #  access, misses, mbd,
+            #  rhits, whits))
+            print(json.dumps({
+                "time": strftime("%H:%M:%S"),
+                "pid": stat[0],
+                "uid": stat[1],
+                "username": username,
+                "comm": stat[2],
+                "hits": stat[3],
+                "misses": stat[4],
+                "dirties": stat[5],
+                "read_hit_percent": stat[6],
+                "write_hit_percent": stat[7]
+            }))
+
+    while 1:
+        if args.json:
+            print_event_json()
+        else:
+            print_event_stdscr()
+
+        countdown -= 1
+        if exiting or countdown == 0:
+            if not args.json:
+                print("Detaching...")
             return
 
 
 def parse_arguments():
     parser = argparse.ArgumentParser(
-        description='show Linux page cache hit/miss statistics including read '
+        description='Show Linux page cache hit/miss statistics including read '
                     'and write hit % per processes in a UI like top.'
     )
+    parser.add_argument("-p", "--pid", type=int, metavar="PID",
+        help="trace this PID only")
     parser.add_argument(
         'interval', type=int, default=5, nargs='?',
         help='Interval between probes.'
     )
+    parser.add_argument("count", nargs="?", default=99999999,
+        help="number of outputs")
+    parser.add_argument("-j", "--json", action="store_true",
+        help="json output")
 
     args = parser.parse_args()
     return args
 
 args = parse_arguments()
-curses.wrapper(handle_loop, args)
+if args.json:
+    handle_loop(None, args)
+else:
+    curses.wrapper(handle_loop, args)

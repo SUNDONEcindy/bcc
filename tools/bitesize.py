@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/env python
 #
 # bitehist.py   Block I/O size histogram.
 #               For Linux, uses BCC, eBPF. See .c file.
@@ -11,9 +11,27 @@
 # Licensed under the Apache License, Version 2.0 (the "License")
 #
 # 05-Feb-2016 Allan McAleavy ran pep8 against file
+# 19-Mar-2019 Brendan Gregg  Switched to use tracepoints.
 
 from bcc import BPF
 from time import sleep
+import argparse
+
+# arguments
+examples = """examples:
+    ./bitesize          # block I/O size histogram
+    ./bitesize -j       # print json output
+"""
+parser = argparse.ArgumentParser(
+    description="Block I/O size histogram",
+    formatter_class=argparse.RawDescriptionHelpFormatter,
+    epilog=examples)
+parser.add_argument("-j", "--json", action="store_true",
+    help="json output")
+parser.add_argument("-d", "--duration", default=99999999,
+    help="total duration of trace in seconds")
+args = parser.parse_args()
+duration = int(args.duration)
 
 bpf_text = """
 #include <uapi/linux/ptrace.h>
@@ -24,53 +42,34 @@ struct proc_key_t {
     u64 slot;
 };
 
-struct val_t {
-    char name[TASK_COMM_LEN];
-};
-
 BPF_HISTOGRAM(dist, struct proc_key_t);
-BPF_HASH(commbyreq, struct request *, struct val_t);
 
-int trace_pid_start(struct pt_regs *ctx, struct request *req)
+TRACEPOINT_PROBE(block, block_rq_issue)
 {
-    struct val_t val = {};
-
-    if (bpf_get_current_comm(&val.name, sizeof(val.name)) == 0) {
-        commbyreq.update(&req, &val);
-    }
-    return 0;
-}
-
-int do_count(struct pt_regs *ctx, struct request *req)
-{
-    struct val_t *valp;
-
-    valp = commbyreq.lookup(&req);
-    if (valp == 0) {
-       return 0;
-    }
-
-    if (req->__data_len > 0) {
-        struct proc_key_t key = {.slot = bpf_log2l(req->__data_len / 1024)};
-        bpf_probe_read(&key.name, sizeof(key.name),valp->name);
-        dist.increment(key);
-    }
+    struct proc_key_t key = {.slot = bpf_log2l(args->bytes / 1024)};
+    bpf_probe_read_kernel(&key.name, sizeof(key.name), args->comm);
+    dist.atomic_increment(key);
     return 0;
 }
 """
 
 # load BPF program
 b = BPF(text=bpf_text)
-b.attach_kprobe(event="blk_account_io_start", fn_name="trace_pid_start")
-b.attach_kprobe(event="blk_account_io_completion", fn_name="do_count")
 
-print("Tracing... Hit Ctrl-C to end.")
+if not args.json:
+    print("Tracing block I/O... Hit Ctrl-C to end.")
 
 # trace until Ctrl-C
 dist = b.get_table("dist")
 
 try:
-    sleep(99999999)
+    sleep(duration)
 except KeyboardInterrupt:
+    pass
+
+if args.json:
+    dist.print_json_hist("kbytes", "comm",
+        section_print_fn=bytes.decode)
+else:
     dist.print_log2_hist("Kbytes", "Process Name",
-            section_print_fn=bytes.decode)
+        section_print_fn=bytes.decode)

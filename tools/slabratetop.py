@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/env python
 # @lint-avoid-python-3-compatibility-imports
 #
 # slabratetop  Summarize kmem_cache_alloc() calls.
@@ -14,12 +14,15 @@
 # Licensed under the Apache License, Version 2.0 (the "License")
 #
 # 15-Oct-2016   Brendan Gregg   Created this.
+# 23-Jan-2023   Rong Tao        Introduce kernel internal data structure and
+#                               functions to temporarily solve problem for
+#                               >=5.16(TODO: fix this workaround)
 
 from __future__ import print_function
 from bcc import BPF
+from bcc.utils import printb
 from time import sleep, strftime
 import argparse
-import signal
 from subprocess import call
 
 # arguments
@@ -41,6 +44,10 @@ parser.add_argument("interval", nargs="?", default=1,
     help="output interval, in seconds")
 parser.add_argument("count", nargs="?", default=99999999,
     help="number of outputs")
+parser.add_argument("--ebpf", action="store_true",
+    help=argparse.SUPPRESS)
+parser.add_argument("-j", "--json", action="store_true",
+    help="json output")
 args = parser.parse_args()
 interval = int(args.interval)
 countdown = int(args.count)
@@ -51,16 +58,96 @@ debug = 0
 # linux stats
 loadavg = "/proc/loadavg"
 
-# signal handler
-def signal_ignore(signal, frame):
-    print()
-
 # define BPF program
 bpf_text = """
 #include <uapi/linux/ptrace.h>
 #include <linux/mm.h>
-#include <linux/slab.h>
+#include <linux/kasan.h>
+
+// memcg_cache_params is a part of kmem_cache, but is not publicly exposed in
+// kernel versions 5.4 to 5.8.  Define an empty struct for it here to allow the
+// bpf program to compile.  It has been completely removed in kernel version
+// 5.9, but it does not hurt to have it here for versions 5.4 to 5.8.
+struct memcg_cache_params {};
+
+// introduce kernel interval slab structure and slab_address() function, solved
+// 'undefined' error for >=5.16. TODO: we should fix this workaround if BCC
+// framework support BTF/CO-RE.
+struct slab {
+    unsigned long __page_flags;
+
+#if defined(CONFIG_SLAB)
+
+    struct kmem_cache *slab_cache;
+    union {
+        struct {
+            struct list_head slab_list;
+            void *freelist; /* array of free object indexes */
+            void *s_mem;    /* first object */
+        };
+        struct rcu_head rcu_head;
+    };
+    unsigned int active;
+
+#elif defined(CONFIG_SLUB)
+
+    struct kmem_cache *slab_cache;
+    union {
+        struct {
+            union {
+                struct list_head slab_list;
+#ifdef CONFIG_SLUB_CPU_PARTIAL
+                struct {
+                    struct slab *next;
+                        int slabs;      /* Nr of slabs left */
+                };
+#endif
+            };
+            /* Double-word boundary */
+            void *freelist;         /* first free object */
+            union {
+                unsigned long counters;
+                struct {
+                    unsigned inuse:16;
+                    unsigned objects:15;
+                    unsigned frozen:1;
+                };
+            };
+        };
+        struct rcu_head rcu_head;
+    };
+    unsigned int __unused;
+
+#elif defined(CONFIG_SLOB)
+
+    struct list_head slab_list;
+    void *__unused_1;
+    void *freelist;         /* first free block */
+    long units;
+    unsigned int __unused_2;
+
+#else
+#error "Unexpected slab allocator configured"
+#endif
+
+    atomic_t __page_refcount;
+#ifdef CONFIG_MEMCG
+    unsigned long memcg_data;
+#endif
+};
+
+// slab_address() will not be used, and NULL will be returned directly, which
+// can avoid adaptation of different kernel versions
+static inline void *slab_address(const struct slab *slab)
+{
+    return NULL;
+}
+
+#ifdef CONFIG_SLUB
 #include <linux/slub_def.h>
+#else
+#include <linux/slab_def.h>
+#endif
 
 #define CACHE_NAME_SIZE 32
 
@@ -80,23 +167,37 @@ BPF_HASH(counts, struct info_t, struct val_t);
 int kprobe__kmem_cache_alloc(struct pt_regs *ctx, struct kmem_cache *cachep)
 {
     struct info_t info = {};
-    bpf_probe_read(&info.name, sizeof(info.name), (void *)cachep->name);
+    const char *name = cachep->name;
+    bpf_probe_read_kernel(&info.name, sizeof(info.name), name);
 
     struct val_t *valp, zero = {};
-    valp = counts.lookup_or_init(&info, &zero);
-    valp->count++;
-    valp->size += cachep->size;
+    valp = counts.lookup_or_try_init(&info, &zero);
+    if (valp) {
+        valp->count++;
+        valp->size += cachep->size;
+    }
 
     return 0;
 }
 """
-if debug:
+if debug or args.ebpf:
     print(bpf_text)
+    if args.ebpf:
+        exit()
+
+def print_json(b):
+    counts = b.get_table("counts")
+    time = strftime("%H:%M:%S")
+    for k, v in sorted(counts.items(), key=lambda counts: counts[1].size):
+       print("{{\"time\": \"{}\", \"cache\": \"{}\", \"allocs\": {}, \"bytes\": {}}}".format(
+           time, k.name.decode(), v.count, v.size))
+    counts.clear()
 
 # initialize BPF
 b = BPF(text=bpf_text)
 
-print('Tracing... Output every %d secs. Hit Ctrl-C to end' % interval)
+if not args.json:
+    print('Tracing... Output every %d secs. Hit Ctrl-C to end' % interval)
 
 # output
 exiting = 0
@@ -106,28 +207,32 @@ while 1:
     except KeyboardInterrupt:
         exiting = 1
 
-    # header
-    if clear:
-        call("clear")
+    if not args.json:
+        # header
+        if clear:
+            call("clear")
+        else:
+            print()
+        with open(loadavg) as stats:
+            print("%-8s loadavg: %s" % (strftime("%H:%M:%S"), stats.read()))
+        print("%-32s %6s %10s" % ("CACHE", "ALLOCS", "BYTES"))
+
+        # by-TID output
+        counts = b.get_table("counts")
+        line = 0
+        for k, v in reversed(sorted(counts.items(),
+                                    key=lambda counts: counts[1].size)):
+            printb(b"%-32s %6d %10d" % (k.name, v.count, v.size))
+
+            line += 1
+            if line >= maxrows:
+                break
+        counts.clear()
     else:
-        print()
-    with open(loadavg) as stats:
-        print("%-8s loadavg: %s" % (strftime("%H:%M:%S"), stats.read()))
-    print("%-32s %6s %10s" % ("CACHE", "ALLOCS", "BYTES"))
-
-    # by-TID output
-    counts = b.get_table("counts")
-    line = 0
-    for k, v in reversed(sorted(counts.items(),
-                                key=lambda counts: counts[1].size)):
-        print("%-32s %6d %10d" % (k.name.decode(), v.count, v.size))
-
-        line += 1
-        if line >= maxrows:
-            break
-    counts.clear()
+        print_json(b)
 
     countdown -= 1
     if exiting or countdown == 0:
-        print("Detaching...")
+        if not args.json:
+            print("Detaching...")
         exit()
